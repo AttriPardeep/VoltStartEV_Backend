@@ -1,0 +1,11 @@
+import { Router } from 'express';
+import authRoutes from './auth.routes.js';
+import chargerRoutes from './charger.routes.js';
+import sessionRoutes from './session.routes.js';
+import userRoutes from './user.routes.js';
+const router = Router();
+router.use('/auth', authRoutes);
+router.use('/chargers', chargerRoutes);
+router.use('/sessions', sessionRoutes);
+router.use('/user', userRoutes);
+export default router;
