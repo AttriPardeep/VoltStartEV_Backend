@@ -1,3 +1,4 @@
+// src/config/database.ts
 import { Sequelize } from 'sequelize';
 import dotenv from 'dotenv';
 import logger from './logger.js';
@@ -50,7 +51,8 @@ export const connectDB = async () => {
   } catch (error: any) {
     logger.error('❌ Database connection failed', { 
       error: error.message,
-      code: error.code 
+      code: error.code,
+      host: config.host 
     });
     process.exit(1);
   }
