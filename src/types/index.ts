@@ -1,3 +1,4 @@
+// src/types/index.ts
 // Reuse your VoltStartEV frontend types for seamless integration
 
 export interface User {
@@ -12,7 +13,7 @@ export interface User {
     batteryCapacity: number; // kWh
     vehicleNumber?: string;
   };
-  savedChargers: string[]; // charger IDs
+  savedChargers: string[];
   paymentMethods: {
     id: string;
     last4: string;
