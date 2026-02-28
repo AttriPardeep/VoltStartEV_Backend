@@ -18,3 +18,20 @@ Production-ready TypeScript backend for the VoltStartEV EV charging application,
 - 🚀 Ubuntu-native deployment (no Docker required)
 
 ## 🏗️ Architecture
+
+
+## Flow 
+VoltStartEV Frontend (React/TS)
+          │
+          ▼ HTTPS/REST + JWT
+VoltStartEV Backend (Node.js/Express/TS)
+          │
+          ├──► SteVe MySQL Database (read: chargers, transactions)
+          ├──► App MySQL Tables (write: app_users, payments)
+          └──► WebSocket Server (real-time stats)
+                    │
+                    ▼ OCPP 1.6
+              SteVe OCPP Server
+                    │
+                    ▼ WebSocket
+              EV Chargers / SAP Simulator
