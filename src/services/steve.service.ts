@@ -6,17 +6,14 @@ import logger from '../config/logger.js';
 export const SteveService = {
   /**
    * Get all available chargers from SteVe's charge_box table
-   * Enriches with connector_status for real-time availability
    */
   async getAvailableChargers(filters?: { 
     lat?: number; 
     lng?: number; 
     maxDistanceKm?: number;
     minPower?: number;
-    type?: string;
   }): Promise<Charger[]> {
     try {
-      // Build dynamic WHERE clause for filters
       const conditions: string[] = ['cb.status = :status'];
       const replacements: any = { status: 'Available' };
       
@@ -24,29 +21,18 @@ export const SteveService = {
         conditions.push('cb.power >= :minPower');
         replacements.minPower = filters.minPower;
       }
-      
-      if (filters?.type) {
-        // Note: SteVe doesn't store connector type by default
-        // This assumes you've extended the schema or use a mapping table
-        conditions.push('cb.connector_type = :type');
-        replacements.type = filters.type;
-      }
 
       const query = `
         SELECT 
           cb.charge_box_id as id,
           cb.charge_point_model as name,
-          cb.charge_point_vendor,
           cb.power,
-          cb.max_current,
           COALESCE(cb.latitude, 28.6139) as lat,
           COALESCE(cb.longitude, 77.2090) as lng,
           COALESCE(cs.status, 'Unknown') as status,
-          cs.connector_id,
           'Type 2' as type,
           12.0 as ratePerUnit,
-          cb.last_heartbeat,
-          TIMESTAMPDIFF(MINUTE, cb.last_heartbeat, NOW()) as minutes_since_heartbeat
+          cb.last_heartbeat
         FROM charge_box cb
         LEFT JOIN connector_status cs 
           ON cb.charge_box_id = cs.charge_box_id 
@@ -54,34 +40,27 @@ export const SteveService = {
         WHERE ${conditions.join(' AND ')}
           AND (cs.status IS NULL OR cs.status IN ('Available', 'Preparing'))
           AND cb.last_heartbeat >= DATE_SUB(NOW(), INTERVAL 10 MINUTE)
-        ORDER BY 
-          minutes_since_heartbeat ASC,
-          cb.power DESC
+        ORDER BY cb.last_heartbeat DESC
         LIMIT 100
       `;
 
-      const [chargers] = await sequelize.query(query, {
+      const results = await sequelize.query(query, {
         replacements,
         type: QueryTypes.SELECT,
       });
 
-      // Transform to frontend-compatible Charger type
-      return (chargers as any[]).map(c => ({
-        id: c.id,
-        name: c.name,
-        lat: parseFloat(c.lat),
-        lng: parseFloat(c.lng),
-        status: c.status as Charger['status'],
-        power: parseFloat(c.power),
-        type: c.type as Charger['type'],
-        ratePerUnit: parseFloat(c.ratePerUnit),
-        // Optional: calculate distance if lat/lng provided
-        ...(filters?.lat && filters?.lng ? {
-          distance: this.calculateDistance(
-            filters.lat!, filters.lng!, 
-            parseFloat(c.lat), parseFloat(c.lng)
-          )
-        } : {}),
+      // Type assertion: results is array of plain objects
+      const chargers = results as Array<Record<string, any>>;
+
+      return chargers.map(c => ({
+        id: String(c.id),
+        name: String(c.name),
+        lat: parseFloat(c.lat) || 28.6139,
+        lng: parseFloat(c.lng) || 77.2090,
+        status: (c.status as Charger['status']) || 'Offline',
+        power: parseFloat(c.power) || 0,
+        type: c.type as Charger['type'] || 'Type 2',
+        ratePerUnit: parseFloat(c.ratePerUnit) || 12.0,
       }));
     } catch (error: any) {
       logger.error('Failed to fetch chargers from SteVe', { error: error.message });
@@ -90,25 +69,19 @@ export const SteveService = {
   },
 
   /**
-   * Get detailed info for a specific charger
+   * Get detailed info for a specific charger - FIXED: proper typing
    */
   async getChargerById(chargeBoxId: string): Promise<Charger | null> {
     try {
-      const [charger] = await sequelize.query(`
+      const results = await sequelize.query(`
         SELECT 
           cb.charge_box_id as id,
           cb.charge_point_model as name,
-          cb.charge_point_vendor,
           cb.power,
-          cb.max_current,
           cb.latitude as lat,
           cb.longitude as lng,
           cb.status as box_status,
-          cs.status as connector_status,
-          cs.connector_id,
-          cb.last_heartbeat,
-          cb.firmware_version,
-          cb.serial_number
+          cs.status as connector_status
         FROM charge_box cb
         LEFT JOIN connector_status cs 
           ON cb.charge_box_id = cs.charge_box_id
@@ -117,19 +90,22 @@ export const SteveService = {
       `, {
         replacements: { chargeBoxId },
         type: QueryTypes.SELECT,
-        plain: true,
+        plain: false, // Return array, not plain object
       });
 
-      if (!charger) return null;
+      const chargers = results as Array<Record<string, any>>;
+      if (!chargers || chargers.length === 0) return null;
+      
+      const charger = chargers[0];
 
       return {
-        id: charger.id,
-        name: charger.name,
+        id: String(charger.id),
+        name: String(charger.name),
         lat: charger.lat ? parseFloat(charger.lat) : 28.6139,
         lng: charger.lng ? parseFloat(charger.lng) : 77.2090,
         status: (charger.connector_status || charger.box_status || 'Offline') as Charger['status'],
-        power: parseFloat(charger.power),
-        type: 'Type 2', // Default; extend schema for dynamic types
+        power: parseFloat(charger.power) || 0,
+        type: 'Type 2',
         ratePerUnit: 12.0,
       };
     } catch (error: any) {
@@ -143,7 +119,7 @@ export const SteveService = {
    */
   async getUserSessions(idTag: string, limit = 50): Promise<ChargingSession[]> {
     try {
-      const [sessions] = await sequelize.query(`
+      const results = await sequelize.query(`
         SELECT 
           t.transaction_id as id,
           t.charge_box_id as chargerId,
@@ -168,12 +144,17 @@ export const SteveService = {
         type: QueryTypes.SELECT,
       });
 
-      // Format duration as "Xh Ym"
-      return (sessions as any[]).map(s => ({
-        ...s,
+      const sessions = results as Array<Record<string, any>>;
+      
+      return sessions.map(s => ({
+        id: String(s.id),
+        chargerId: String(s.chargerId),
+        chargerName: String(s.chargerName),
+        date: s.date instanceof Date ? s.date.toISOString() : String(s.date),
         duration: this.formatDuration(s.durationMinutes),
         energyDelivered: parseFloat(s.energyDelivered?.toFixed(2) || '0'),
         cost: parseFloat(s.cost),
+        status: s.status as 'completed' | 'active' | 'failed',
       }));
     } catch (error: any) {
       logger.error(`Failed to fetch sessions for id_tag ${idTag}`, { error: error.message });
@@ -183,7 +164,6 @@ export const SteveService = {
 
   /**
    * Register new user's RFID tag in SteVe's authorization_cache
-   * This enables OCPP authorization at the charger
    */
   async registerIdTag(idTag: string, userId: string, userInfo?: string): Promise<boolean> {
     try {
@@ -205,21 +185,6 @@ export const SteveService = {
       logger.error(`Failed to register id_tag ${idTag}`, { error: error.message });
       return false;
     }
-  },
-
-  /**
-   * Helper: Calculate distance between two coordinates (Haversine formula)
-   */
-  calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
-    const R = 6371; // Earth's radius in km
-    const dLat = (lat2 - lat1) * Math.PI / 180;
-    const dLon = (lon2 - lon1) * Math.PI / 80;
-    const a = 
-      Math.sin(dLat/2) * Math.sin(dLat/2) +
-      Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
-      Math.sin(dLon/2) * Math.sin(dLon/2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-    return parseFloat((R * c).toFixed(2));
   },
 
   /**
