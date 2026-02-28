@@ -1,3 +1,4 @@
+// src/app.ts
 import express, { Application, Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -6,9 +7,8 @@ import dotenv from 'dotenv';
 
 import logger from './config/logger.js';
 import { connectDB } from './config/database.js';
-import routes from './routes/index.js';
-import { errorHandler } from './middleware/errorHandler.js';
-import { successResponse } from './utils/response.js';
+import { authenticate } from './middleware/auth.js';
+import { errorResponse } from './utils/response.js';
 
 dotenv.config();
 
@@ -32,7 +32,7 @@ app.use(cors(corsOptions));
 // Rate limiting
 const limiter = rateLimit({
   windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '900000'), // 15 min
-  max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '100'), // 100 requests per window
+  max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '100'),
   message: { success: false, error: { code: 'RATE_LIMITED', message: 'Too many requests, please try again later' }},
   standardHeaders: true,
   legacyHeaders: false,
@@ -43,18 +43,37 @@ app.use('/api/', limiter);
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Health check endpoint
+// Health check endpoint (public)
 app.get('/health', (req: Request, res: Response) => {
-  res.json(successResponse({ 
-    status: 'ok', 
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    environment: process.env.NODE_ENV 
-  }));
+  res.json({ 
+    success: true, 
+    data: { 
+      status: 'ok', 
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime(),
+      environment: process.env.NODE_ENV 
+    } 
+  });
 });
 
-// API routes
-app.use('/api', routes);
+// Test endpoint (public)
+app.get('/api/test', (req: Request, res: Response) => {
+  res.json({ 
+    success: true, 
+    data: { message: 'VoltStartEV Backend is running!', version: '1.0.0' } 
+  });
+});
+
+// Protected test endpoint (requires auth)
+app.get('/api/protected', authenticate, (req: Request, res: Response) => {
+  res.json({ 
+    success: true, 
+    data: { 
+      message: 'Authentication successful!', 
+      user: req.user 
+    } 
+  });
+});
 
 // 404 handler
 app.use((req: Request, res: Response) => {
@@ -65,9 +84,26 @@ app.use((req: Request, res: Response) => {
 });
 
 // Global error handler (must be last)
-app.use(errorHandler);
+app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
+  logger.error('Unhandled error', { 
+    error: err.message, 
+    stack: err.stack,
+    path: req.path,
+    method: req.method 
+  });
+  
+  res.status(500).json({ 
+    success: false, 
+    error: { 
+      code: 'INTERNAL_ERROR', 
+      message: process.env.NODE_ENV === 'production' 
+        ? 'Something went wrong' 
+        : err.message 
+    } 
+  });
+});
 
-// Initialize database connection
+// Initialize database connection and start server
 const start = async () => {
   try {
     await connectDB();
