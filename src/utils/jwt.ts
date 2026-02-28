@@ -1,7 +1,11 @@
 import jwt from 'jsonwebtoken';
+
 export const generateToken = (payload: object, expiresIn = '7d'): string => {
-  return jwt.sign(payload, process.env.JWT_SECRET || 'dev_secret', { expiresIn });
+  const secret = (process.env.JWT_SECRET || 'dev_secret_change_in_production') as jwt.Secret;
+  return jwt.sign(payload, secret, { expiresIn } as jwt.SignOptions);
 };
+
 export const verifyToken = (token: string): any => {
-  return jwt.verify(token, process.env.JWT_SECRET || 'dev_secret');
+  const secret = (process.env.JWT_SECRET || 'dev_secret_change_in_production') as jwt.Secret;
+  return jwt.verify(token, secret);
 };
