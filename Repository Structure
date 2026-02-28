@@ -1,0 +1,77 @@
+voltstartev-backend/
+├── 📄 README.md
+├── 📄 .gitignore
+├── 📄 .env.example
+├── 📄 package.json
+├── 📄 tsconfig.json
+├── 📄 eslint.config.js
+├── 📄 jest.config.js
+├── 📄 ecosystem.config.js          # PM2 deployment config
+├── 📄 deploy-ubuntu.sh            # One-click Ubuntu setup script
+│
+├── 📁 src/
+│   ├── 📄 app.ts                  # Express app setup
+│   ├── 📄 server.ts               # Entry point
+│   │
+│   ├── 📁 config/
+│   │   ├── 📄 database.ts         # Sequelize MySQL connection
+│   │   ├── 📄 websocket.ts        # WebSocket server setup
+│   │   └── 📄 logger.ts           # Winston logger config
+│   │
+│   ├── 📁 controllers/
+│   │   ├── 📄 auth.controller.ts
+│   │   ├── 📄 charger.controller.ts
+│   │   ├── 📄 session.controller.ts
+│   │   ├── 📄 user.controller.ts
+│   │   └── 📄 health.controller.ts
+│   │
+│   ├── 📁 middleware/
+│   │   ├── 📄 auth.ts             # JWT verification
+│   │   ├── 📄 validate.ts         # Zod request validation
+│   │   ├── 📄 errorHandler.ts     # Centralized error handling
+│   │   └── 📄 rateLimiter.ts      # API rate limiting
+│   │
+│   ├── 📁 routes/
+│   │   ├── 📄 auth.routes.ts
+│   │   ├── 📄 charger.routes.ts
+│   │   ├── 📄 session.routes.ts
+│   │   ├── 📄 user.routes.ts
+│   │   └── 📄 index.ts            # Route aggregator
+│   │
+│   ├── 📁 services/
+│   │   ├── 📄 steve.service.ts    # SteVe DB queries (read-only)
+│   │   ├── 📄 auth.service.ts     # OTP + JWT logic
+│   │   ├── 📄 wallet.service.ts   # Balance + payment logic
+│   │   └── 📄 ocpp.service.ts     # Optional OCPP command sender
+│   │
+│   ├── 📁 types/
+│   │   ├── 📄 index.ts            # Shared types (match frontend)
+│   │   └── 📄 api.ts              # API request/response types
+│   │
+│   ├── 📁 utils/
+│   │   ├── 📄 otp.ts              # OTP generation/validation
+│   │   ├── 📄 jwt.ts              # JWT helpers
+│   │   └── 📄 response.ts         # Standardized API responses
+│   │
+│   └── 📁 schemas/
+│       ├── 📄 auth.schema.ts
+│       ├── 📄 charger.schema.ts
+│       ├── 📄 session.schema.ts
+│       └── 📄 user.schema.ts
+│
+├── 📁 tests/
+│   ├── 📁 integration/
+│   │   ├── 📄 auth.test.ts
+│   │   ├── 📄 chargers.test.ts
+│   │   └── 📄 sessions.test.ts
+│   └── 📁 unit/
+│       ├── 📄 otp.test.ts
+│       └── 📄 steve.service.test.ts
+│
+├── 📁 scripts/
+│   ├── 📄 setup-db.sql            # MySQL user + table setup
+│   └── 📄 seed-chargers.ts        # Optional: preload charger locations
+│
+└── 📁 docs/
+    ├── 📄 API.md                  # OpenAPI-style endpoint docs
+    └── 📄 DEPLOYMENT.md           # Ubuntu/PM2 deployment guide
