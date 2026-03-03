@@ -156,16 +156,17 @@ export async function getConnectorMetrics(
     ORDER BY cmv.value_timestamp DESC
     LIMIT 50
   `, [chargeBoxId, connectorId]);
-  
-  return metrics.map((m: any) => ({
-    timestamp: m.value_timestamp,
-    measurand: m.measurand,
-    value: parseFloat(m.value) || 0,
-    unit: m.unit,
-    phase: m.phase,
-    location: m.location,
-    context: m.reading_context,
-  }));
+
+return metrics.map((m: any) => ({
+  timestamp: m.value_timestamp,
+  measurand: m.measurand,
+  value: String(m.value),  // ✅ Keep as string per OCPP spec
+  unit: m.unit,
+  phase: m.phase,
+  location: m.location,
+  context: m.reading_context || 'Sample.Periodic',  // Default if null
+}));
+
 }
 
 /**
