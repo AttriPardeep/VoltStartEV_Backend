@@ -79,42 +79,39 @@ export async function getAllChargers(): Promise<ChargerStatus[]> {
 /**
  * Fetch single charger by chargeBoxId with full connector details
  */
+
 export async function getChargerById(chargeBoxId: string): Promise<ChargerStatus | null> {
   const rows = await steveQuery<any>(`
-    SELECT 
+    SELECT
       cb.charge_box_id,
       cb.registration_status,
       cb.last_heartbeat_timestamp,
       c.connector_id,
-      cs_latest.status as connector_status,
-      cs_latest.error_code,
-      cs_latest.error_info,
-      cs_latest.status_timestamp
+      cs.status as connector_status,
+      cs.error_code,
+      cs.error_info,
+      cs.status_timestamp
     FROM charge_box cb
     LEFT JOIN connector c ON c.charge_box_id = cb.charge_box_id
-    LEFT JOIN (
-      SELECT cs1.*
-      FROM connector_status cs1
-      INNER JOIN (
-        SELECT connector_pk, MAX(status_timestamp) as max_ts
-        FROM connector_status
-        GROUP BY connector_pk
-      ) cs2 ON cs1.connector_pk = cs2.connector_pk 
-           AND cs1.status_timestamp = cs2.max_ts
-    ) cs_latest ON cs_latest.connector_pk = c.connector_pk
+    LEFT JOIN connector_status cs ON cs.connector_pk = c.connector_pk
     WHERE cb.charge_box_id = ?
+    AND cs.status_timestamp = (
+      SELECT MAX(cs2.status_timestamp)
+      FROM connector_status cs2
+      WHERE cs2.connector_pk = c.connector_pk
+    )
     ORDER BY c.connector_id
   `, [chargeBoxId]);
 
   if (rows.length === 0) return null;
-  
+
   const charger: ChargerStatus = {
     chargeBoxId: rows[0].charge_box_id,
     registrationStatus: rows[0].registration_status,
     lastHeartbeat: rows[0].last_heartbeat_timestamp,
     connectors: [],
   };
-  
+
   for (const row of rows) {
     if (row.connector_id !== null) {
       charger.connectors.push({
@@ -126,7 +123,7 @@ export async function getChargerById(chargeBoxId: string): Promise<ChargerStatus
       });
     }
   }
-  
+
   return charger;
 }
 

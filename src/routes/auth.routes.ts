@@ -1,5 +1,8 @@
 import { Router, Request, Response } from 'express';
 import { errorResponse, successResponse } from '../utils/response.js';
+import { validateIdTag } from '../services/ocpp/auth.service.js';  // ✅ Added
+import logger from '../config/logger.js';                           // ✅ Added
+
 //import { generateOTP, generateIdTag } from '../utils/otp.js';
 const router = Router();
 const otpStore = new Map<string, { code: string; expires: number }>();
@@ -24,6 +27,53 @@ const otpStore = new Map<string, { code: string; expires: number }>();
 //  otpStore.delete(identifier);
 //  return successResponse(res, { message: 'Authentication successful', token, user: mockUser }, 'Logged in', 200);
 //});
+//
+
+
+// ─────────────────────────────────────────────────────
+// OCPP 1.6 Authorize Endpoint
+// POST /api/auth/authorize - Validate RFID/App token
+// ─────────────────────────────────────────────────────
+router.post('/authorize', async (req: Request, res: Response) => {
+  console.log(`🔐 Authorize request: idTag=${req.body.idTag}`);
+
+  try {
+    const { idTag } = req.body;
+
+    if (!idTag) {
+      return res.status(400).json({
+        success: false,
+        error: 'Bad request',
+        message: 'idTag is required',
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    // Validate against SteVe's ocpp_tag + ocpp_tag_activity tables
+    const authResult = await validateIdTag(idTag);
+
+    // Return OCPP 1.6 compliant Authorize response
+    // https://ocpp-spec.org/schemas/v1.6/#Authorize
+    res.status(200).json({
+      idTagInfo: {
+        expiryDate: authResult.expiryDate,      // ISO 8601 or undefined
+        parentIdTag: authResult.parentIdTag,    // string or undefined
+        status: authResult.status,              // "Accepted"|"Blocked"|"Expired"|"Invalid"|"ConcurrentTx"
+      },
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    logger.error('Authorize endpoint error', { error });
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: error instanceof Error ? error.message : 'Unknown error',
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
 router.post('/login/demo', (req: Request, res: Response) => {
   const { mobile, name } = req.body;
   

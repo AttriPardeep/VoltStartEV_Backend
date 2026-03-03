@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import authRoutes from './auth.routes.js';
-import chargerRoutes from './charger.routes.js';
+import chargerRoutes from './chargers.routes.js';
 import sessionRoutes from './session.routes.js';
 import userRoutes from './user.routes.js';
 const router = Router();
