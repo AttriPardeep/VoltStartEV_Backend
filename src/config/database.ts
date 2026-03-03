@@ -1,71 +1,72 @@
-import { Sequelize } from 'sequelize';
-import dotenv from 'dotenv';
-import logger from './logger.js';
+import mysql from 'mysql2/promise';
+import winston from './logger';
 
-dotenv.config();
-
-const config = {
+// Read-only connection pool for SteVe database
+// Uses your existing MySQL config with security constraints
+export const steveDb = mysql.createPool({
   host: process.env.STEVE_DB_HOST || 'localhost',
   port: parseInt(process.env.STEVE_DB_PORT || '3306'),
-  database: process.env.STEVE_DB_NAME || 'stevedb',
-  username: process.env.STEVE_DB_USER || 'root',
-  password: process.env.STEVE_DB_PASS || '',
-  dialect: 'mysql' as const,
-  logging: (msg: string) => logger.debug(msg),
-  pool: {
-    max: 20,
-    min: 2,
-    acquire: 30000,
-    idle: 10000,
-  },
-  dialectOptions: {
-    connectTimeout: 10000,
-    // Disable SSL for localhost connections (self-signed cert issue)
-    ssl: process.env.STEVE_DB_HOST === 'localhost' || process.env.STEVE_DB_HOST === '127.0.0.1' 
-      ? false 
-      : { rejectUnauthorized: true },
-  },
-};
+  user: process.env.STEVE_DB_USER || 'steve_readonly', // ⚠️ Create dedicated read-only user
+  password: process.env.STEVE_DB_PASSWORD,
+  database: 'stevedb',
+  
+  // Security & Performance Settings
+  connectionLimit: 10,
+  waitForConnections: true,
+  queueLimit: 0,
+  
+  // ⚠️ CRITICAL: Enforce read-only at connection level
+  // Prevents accidental writes to SteVe's operational tables
+  initSql: 'SET SESSION TRANSACTION READ ONLY',
+  
+  // Timeouts to prevent hanging connections
+  connectTimeout: 10000,
+  acquireTimeout: 10000,
+  timeout: 30000,
+  
+  // SSL recommended for production (optional for local dev)
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: true } : undefined,
+});
 
-export const sequelize = new Sequelize(
-  config.database,
-  config.username,
-  config.password,
-  {
-    host: config.host,
-    port: config.port,
-    dialect: config.dialect,
-    logging: config.logging,
-    pool: config.pool,
-    dialectOptions: config.dialectOptions,
-  }
-);
-
-export const connectDB = async () => {
+// Health check utility
+export async function testSteveConnection(): Promise<boolean> {
   try {
-    await sequelize.authenticate();
-    logger.info('✅ Connected to SteVe MySQL database', { 
-      host: config.host, 
-      database: config.database 
-    });
+    const connection = await steveDb.getConnection();
+    await connection.ping();
+    connection.release();
+    winston.info('✅ SteVe database connection successful');
     return true;
-  } catch (error: any) {
-    logger.error('❌ Database connection failed', { 
-      error: error.message,
-      code: error.code,
-      host: config.host 
-    });
-    process.exit(1);
+  } catch (error) {
+    winston.error('❌ SteVe database connection failed', { error: error instanceof Error ? error.message : error });
+    return false;
   }
-};
+}
 
-export const closeDB = async () => {
+// Graceful shutdown handler
+export async function closeSteveConnection(): Promise<void> {
+  await steveDb.end();
+  winston.info('🔌 SteVe database pool closed');
+}
+
+// Type-safe query wrapper with logging
+export async function steveQuery<T>(sql: string, params?: any[]): Promise<T[]> {
+  const start = Date.now();
   try {
-    await sequelize.close();
-    logger.info('🔌 Database connection closed');
-  } catch (error: any) {
-    logger.error('Error closing database', { error: error.message });
+    const [rows] = await steveDb.execute<[T[]]>(sql, params || []);
+    const duration = Date.now() - start;
+    
+    // Log slow queries (>500ms) for optimization
+    if (duration > 500) {
+      winston.warn('⚠️ Slow SteVe query detected', { sql, duration, params });
+    }
+    
+    return rows;
+  } catch (error) {
+    winston.error('💥 SteVe query failed', { 
+      sql, 
+      error: error instanceof Error ? error.message : error,
+      params 
+    });
+    throw error;
   }
-};
-
-export default sequelize;
+}

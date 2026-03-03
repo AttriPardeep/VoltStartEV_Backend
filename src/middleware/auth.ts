@@ -1,79 +1,122 @@
+// src/middleware/auth.ts - MVP version with env flag support
+
 import { Request, Response, NextFunction } from 'express';
-import jwt from 'jsonwebtoken';
 import logger from '../config/logger.js';
-import { Request, Response, NextFunction } from 'express';
 
-
-// ✅ Updated to match what auth middleware actually attaches
 export interface AuthenticatedRequest extends Request {
   user?: {
-    id: string;           // ← was 'userId', change to 'id'
-    name: string;         // ← add missing
-    mobile: string;       // ← add missing
+    id: string;
+    name: string;
+    mobile: string;
     idTag: string;
-    walletBalance: number; // ← add missing (for future)
-    phone?: string;       // ← keep optional
-    email?: string;       // ← keep optional
+    walletBalance: number;
+    phone?: string;
+    email?: string;
   };
 }
 
-export const authenticate = (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
-  // For MVP: Skip real auth, just attach mock user from idTag header/body
-  const idTag = req.headers['x-id-tag'] as string || req.body?.idTag;
+// Read MVP flags from environment
+const IS_MVP_MODE = process.env.SKIP_OTP === 'true';
+const MOCK_IDTAG = process.env.MOCK_IDTAG || 'TEST001';
+const MOCK_USER_ID = process.env.MOCK_USER_ID || 'mvp-test-user';
+const ALLOW_GUEST = process.env.ALLOW_GUEST_ACCESS === 'true';
 
-  if (!idTag) {
-    // For MVP: Allow unauthenticated access to core features
-    // Remove this block later when adding real auth
-    req.user = {
-      id: 'mock-user',
-      name: 'Test User',
-      mobile: '0000000000',
-      idTag: 'MOCK_TAG',
-      walletBalance: 0,
-    };
-    return next();
-  }
-
-  // Attach user object (mocked for now)
-  req.user = {
-    id: `user_${idTag}`,
-    name: `User ${idTag}`,
-    mobile: '0000000000',
-    idTag,
-    walletBalance: 100, // Mock balance
-  };
-
-  next();
-};
-
-export interface AuthenticatedRequest extends Request {
-  user?: { userId: string; idTag: string; phone?: string; email?: string };
-}
-export const authenticate = (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+export const authenticate = (req: AuthenticatedRequest, res: Response, next: NextFunction): void => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader?.startsWith('Bearer ')) {
-      return res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'No token provided' } });
+    // 🚀 MVP MODE: Auto-authenticate with mock user if OTP is skipped
+    if (IS_MVP_MODE) {
+      const idTag = (req.headers['x-id-tag'] as string) || req.body?.idTag || MOCK_IDTAG;
+      
+      req.user = {
+        id: `mvp_${MOCK_USER_ID}`,
+        name: 'MVP Test User',
+        mobile: '0000000000',
+        idTag,
+        walletBalance: 9999,  // Unlimited mock balance for testing
+      };
+      
+      logger.debug(`[MVP MODE] Auto-authenticated: idTag=${idTag}`);
+      return next();
     }
-    const token = authHeader.split(' ')[1];
-    const decoded = jwt.verify(token, process.env.JWT_SECRET!) as any;
-    req.user = { userId: decoded.userId, idTag: decoded.idTag, phone: decoded.phone, email: decoded.email };
-    next();
+
+    // 🔄 Normal flow: Check for idTag header/body
+    const idTag = (req.headers['x-id-tag'] as string) || req.body?.idTag;
+    
+    if (idTag) {
+      req.user = {
+        id: `user_${idTag.replace(/[^a-zA-Z0-9]/g, '_')}`,
+        name: `User ${idTag}`,
+        mobile: '0000000000',
+        idTag,
+        walletBalance: 100,
+      };
+      logger.debug(`Authenticated: idTag=${idTag}`);
+      return next();
+    }
+    
+    // 🚪 Guest access (if enabled)
+    if (ALLOW_GUEST) {
+      req.user = {
+        id: 'guest',
+        name: 'Guest User',
+        mobile: '0000000000',
+        idTag: 'GUEST',
+        walletBalance: 0,
+      };
+      logger.debug('Guest access granted');
+      return next();
+    }
+    
+    // ❌ No auth found and guest not allowed
+    logger.warn('Authentication required but not provided');
+    res.status(401).json({ 
+      success: false, 
+      error: 'Authentication required. Provide x-id-tag header or idTag in body.' 
+    });
+    
   } catch (error: any) {
-    logger.warn('JWT verification failed', { error: error.name, message: error.message, ip: req.ip });
-    if (error.name === 'TokenExpiredError') return res.status(401).json({ success: false, error: { code: 'TOKEN_EXPIRED', message: 'Session expired' } });
-    if (error.name === 'JsonWebTokenError') return res.status(401).json({ success: false, error: { code: 'INVALID_TOKEN', message: 'Invalid token' } });
-    return res.status(500).json({ success: false, error: { code: 'AUTH_ERROR', message: 'Authentication failed' } });
+    logger.error('Auth middleware error', { error: error.message });
+    // MVP: Fail open to avoid blocking testing
+    if (IS_MVP_MODE || ALLOW_GUEST) {
+      req.user = {
+        id: 'fallback',
+        name: 'Fallback User',
+        mobile: '0000000000',
+        idTag: 'FALLBACK',
+        walletBalance: 0,
+      };
+      return next();
+    }
+    res.status(500).json({ success: false, error: 'Authentication service error' });
   }
 };
-export const optionalAuth = (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+
+export const optionalAuth = (req: AuthenticatedRequest, res: Response, next: NextFunction): void => {
+  // Same logic but never blocks - just attaches user if possible
   try {
-    const authHeader = req.headers.authorization;
-    if (authHeader?.startsWith('Bearer ')) {
-      const token = authHeader.split(' ')[1];
-      const decoded = jwt.verify(token, process.env.JWT_SECRET!) as any;
-      req.user = { userId: decoded.userId, idTag: decoded.idTag, phone: decoded.phone, email: decoded.email };
+    if (IS_MVP_MODE) {
+      const idTag = (req.headers['x-id-tag'] as string) || req.body?.idTag || MOCK_IDTAG;
+      req.user = {
+        id: `mvp_${MOCK_USER_ID}`,
+        name: 'MVP Test User',
+        mobile: '0000000000',
+        idTag,
+        walletBalance: 9999,
+      };
+    } else {
+      const idTag = (req.headers['x-id-tag'] as string) || req.body?.idTag;
+      if (idTag) {
+        req.user = {
+          id: `user_${idTag.replace(/[^a-zA-Z0-9]/g, '_')}`,
+          name: `User ${idTag}`,
+          mobile: '0000000000',
+          idTag,
+          walletBalance: 100,
+        };
+      }
     }
     next();
-  } catch (error) { next(); }
+  } catch {
+    next();
+  }
 };

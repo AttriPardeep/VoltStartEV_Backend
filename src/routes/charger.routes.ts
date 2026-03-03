@@ -1,24 +1,23 @@
+// src/routes/charger.routes.ts
 import { Router, Request, Response } from 'express';
 import { SteveService } from '../services/steve.service.js';
 import { errorResponse, successResponse } from '../utils/response.js';
-// ✅ ADD: Import demo auth middleware
-import { demoAuth } from '../middleware/auth.demo.js';
+import logger from '../config/logger.js'; // ✅ Added missing import
 
 const router = Router();
 
-// ✅ Existing GET routes (unchanged)
+// GET /api/chargers - List available chargers
 router.get('/', async (req: Request, res: Response) => {
   try {
     const chargers = await SteveService.getAvailableChargers();
-    return successResponse(res, { 
-      chargers, 
-      count: chargers.length 
-    }, 'Chargers fetched');
+    return successResponse(res, { chargers, count: chargers.length }, 'Chargers fetched');
   } catch (error: any) {
+    logger.error('Charger list error', { error: error.message });
     return errorResponse(res, 'CHARGER_FETCH_ERROR', error.message, 500);
   }
 });
 
+// GET /api/chargers/:id - Get charger details
 router.get('/:id', async (req: Request, res: Response) => {
   try {
     const charger = await SteveService.getChargerById(req.params.id);
@@ -27,26 +26,21 @@ router.get('/:id', async (req: Request, res: Response) => {
     }
     return successResponse(res, { charger }, 'Charger details');
   } catch (error: any) {
+    logger.error('Charger details error', { error: error.message });
     return errorResponse(res, 'CHARGER_FETCH_ERROR', error.message, 500);
   }
 });
 
-// ✅✅✅ ADD THESE NEW ROUTES FOR START/STOP CHARGING ✅✅✅
-
-// POST /api/charger/start - Start charging session
-// ✅ FIX: startCharging now expects an object, not 3 separate args
+// ✅ POST /api/chargers/start - Start charging session (MVP core feature)
 router.post('/start', async (req: Request, res: Response) => {
   try {
     const { chargeBoxId, connectorId, idTag, startValue } = req.body;
     
-    if (!chargeBoxId || !connectorId || !idTag) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Missing required fields: chargeBoxId, connectorId, idTag' 
-      });
+    if (!chargeBoxId || connectorId === undefined || !idTag) {
+      return errorResponse(res, 'MISSING_PARAMS', 'Required: chargeBoxId, connectorId, idTag', 400);
     }
 
-    // ✅ Pass as single object matching StartChargingRequest interface
+    // ✅ Call service with object parameter (matches SteveService.startCharging signature)
     const result = await SteveService.startCharging({
       chargeBoxId,
       connectorId: parseInt(connectorId),
@@ -55,73 +49,56 @@ router.post('/start', async (req: Request, res: Response) => {
     });
 
     if (result.success) {
-      res.status(200).json({
-        success: true,
-        message: result.message,
-        data: { transactionId: result.transactionId }
-      });
+      return successResponse(res, { transactionId: result.transactionId }, result.message, 201);
     } else {
-      res.status(400).json({ success: false, error: result.message });
+      return errorResponse(res, 'START_FAILED', result.message || 'Failed to start charging', 400);
     }
   } catch (error: any) {
-    logger.error('Start charging route error', { error: error.message });
-    res.status(500).json({ success: false, error: 'Internal server error' });
+    logger.error('Start charging route error', { error: error.message, body: req.body });
+    return errorResponse(res, 'START_ERROR', error.message, 500);
   }
 });
 
-// ✅ FIX: stopCharging now expects an object, not 2 separate args  
+// ✅ POST /api/chargers/stop - Stop charging session (MVP core feature)
 router.post('/stop', async (req: Request, res: Response) => {
   try {
     const { transactionId, chargeBoxId, connectorId, stopValue, stopReason } = req.body;
     
-    if (!transactionId && (!chargeBoxId || !connectorId)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Provide either transactionId OR (chargeBoxId + connectorId)'
-      });
+    if (!transactionId && (!chargeBoxId || connectorId === undefined)) {
+      return errorResponse(res, 'MISSING_PARAMS', 'Provide transactionId OR (chargeBoxId + connectorId)', 400);
     }
 
-    // ✅ Pass as single object matching StopChargingRequest interface
+    // ✅ Call service with object parameter (matches SteveService.stopCharging signature)
     const result = await SteveService.stopCharging({
       transactionId: transactionId ? parseInt(transactionId) : undefined,
       chargeBoxId,
-      connectorId: connectorId ? parseInt(connectorId) : undefined,
+      connectorId: connectorId !== undefined ? parseInt(connectorId) : undefined,
       stopValue: stopValue ? parseFloat(stopValue) : undefined,
       stopReason,
     });
 
     if (result.success) {
-      res.status(200).json({
-        success: true,
-        message: result.message,
-        data: {
-          transactionId: result.transactionId,
-          energyDelivered: result.energyDelivered,
-        }
-      });
+      return successResponse(res, { 
+        transactionId: result.transactionId,
+        energyDelivered: result.energyDelivered 
+      }, result.message);
     } else {
-      res.status(400).json({ success: false, error: result.message });
+      return errorResponse(res, 'STOP_FAILED', result.message || 'Failed to stop charging', 400);
     }
   } catch (error: any) {
-    logger.error('Stop charging route error', { error: error.message });
-    res.status(500).json({ success: false, error: 'Internal server error' });
+    logger.error('Stop charging route error', { error: error.message, body: req.body });
+    return errorResponse(res, 'STOP_ERROR', error.message, 500);
   }
 });
 
-// ✅ ADD: Get real-time charger metrics (current, voltage, energy)
+// GET /api/chargers/:id/metrics - Real-time charger metrics
 router.get('/:id/metrics', async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
-    
-    const metrics = await SteveService.getChargerMetrics(id);
-    
-    return successResponse(res, { 
-      chargerId: id,
-      metrics 
-    }, 'Charger metrics fetched');
-    
+    const metrics = await SteveService.getChargerMetrics(req.params.id);
+    return successResponse(res, { metrics, chargerId: req.params.id }, 'Metrics fetched');
   } catch (error: any) {
-    return errorResponse(res, 'METRICS_FETCH_ERROR', error.message, 500);
+    logger.error('Metrics fetch error', { error: error.message });
+    return errorResponse(res, 'METRICS_ERROR', error.message, 500);
   }
 });
 

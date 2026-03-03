@@ -197,3 +197,15 @@ export const createResponse = <T>(
   error,
   timestamp: new Date().toISOString(),
 });
+
+// ============================================================================
+// API RESPONSE TYPE (must match response.ts usage)
+// ============================================================================
+
+export interface ApiResponse<T = any> {
+  success: boolean;
+  message?: string;
+  data?: T;
+  error?: string;  // ✅ Must be string, not object
+  timestamp: string; // ✅ Required field
+}
