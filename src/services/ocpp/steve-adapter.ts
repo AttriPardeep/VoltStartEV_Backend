@@ -71,23 +71,25 @@ export async function getAllChargers(): Promise<ChargerStatus[]> {
  * Fetch single charger by chargeBoxId with full connector details
  */
 export async function getChargerById(chargeBoxId: string): Promise<ChargerStatus | null> {
-  const rows = await steveQuery<any>(`
+   const rows = await steveQuery<any>(`
     SELECT 
       cb.charge_box_id,
       cb.registration_status,
       cb.last_heartbeat_timestamp,
-      c.connector_id,
-      cs.status as connector_status,
+      c.connector_id,          -- ← connector_id is in 'connector' table
+      cs.status,               -- ← No alias needed
       cs.error_code,
       cs.error_info,
       cs.status_timestamp
     FROM charge_box cb
-    LEFT JOIN connector c ON c.charge_box_id = cb.charge_box_id
-    LEFT JOIN connector_status cs ON cs.connector_pk = c.connector_pk
+    LEFT JOIN connector c 
+      ON c.charge_box_id = cb.charge_box_id  -- ← Correct join key
+    LEFT JOIN connector_status cs 
+      ON cs.connector_pk = c.connector_pk    -- ← Correct join key
     WHERE cb.charge_box_id = ?
     ORDER BY c.connector_id
   `, [chargeBoxId]);
-  
+
   if (rows.length === 0) return null;
   
   const charger: ChargerStatus = {
