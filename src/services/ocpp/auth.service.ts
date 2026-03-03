@@ -1,5 +1,5 @@
-import { steveQuery } from '../../config/database';
-import winston from '../../config/logger';
+import { steveQuery } from '../../config/database.js';
+import winston from '../../config/logger.js';
 import { AuthorizationStatusSchema } from '../../types/ocpp-1.6';
 import { z } from 'zod';
 
@@ -107,7 +107,7 @@ export async function getUserIdByTag(idTag: string): Promise<number | null> {
  */
 export async function updateTagActivity(
   idTag: string, 
-  delta: +1 | -1
+  delta: 1 | -1
 ): Promise<void> {
   // This is optional: SteVe may handle this internally
   // Only uncomment if your backend has INSERT/UPDATE permissions on ocpp_tag_activity

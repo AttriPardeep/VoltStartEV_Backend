@@ -1,5 +1,5 @@
-import { steveQuery } from '../../config/database';
-import winston from '../../config/logger';
+import { steveQuery } from '../../config/database.js';
+import winston from '../../config/logger.js';
 import { ChargePointStatusSchema } from '../../types/ocpp-1.6';
 import { z } from 'zod';
 
@@ -29,17 +29,26 @@ export async function getAllChargers(): Promise<ChargerStatus[]> {
       cb.registration_status,
       cb.last_heartbeat_timestamp,
       c.connector_id,
-      cs.status as connector_status,
-      cs.error_code,
-      cs.error_info,
-      cs.status_timestamp
+      cs_latest.status as connector_status,
+      cs_latest.error_code,
+      cs_latest.error_info,
+      cs_latest.status_timestamp
     FROM charge_box cb
-    LEFT JOIN connector c ON c.charge_box_id = c.charge_box_id AND c.connector_id = c.connector_id
-    LEFT JOIN connector_status cs ON cs.connector_pk = c.connector_pk
+    LEFT JOIN connector c ON c.charge_box_id = cb.charge_box_id
+    LEFT JOIN (
+      -- Subquery: Get ONLY the latest status per connector_pk
+      SELECT cs1.*
+      FROM connector_status cs1
+      INNER JOIN (
+        SELECT connector_pk, MAX(status_timestamp) as max_ts
+        FROM connector_status
+        GROUP BY connector_pk
+      ) cs2 ON cs1.connector_pk = cs2.connector_pk 
+           AND cs1.status_timestamp = cs2.max_ts
+    ) cs_latest ON cs_latest.connector_pk = c.connector_pk
     WHERE cb.registration_status = 'Accepted'
     ORDER BY cb.charge_box_id, c.connector_id
   `);
-
   // Group flat rows into hierarchical charger→connectors structure
   const chargersMap = new Map<string, ChargerStatus>();
   
@@ -71,21 +80,28 @@ export async function getAllChargers(): Promise<ChargerStatus[]> {
  * Fetch single charger by chargeBoxId with full connector details
  */
 export async function getChargerById(chargeBoxId: string): Promise<ChargerStatus | null> {
-   const rows = await steveQuery<any>(`
+  const rows = await steveQuery<any>(`
     SELECT 
       cb.charge_box_id,
       cb.registration_status,
       cb.last_heartbeat_timestamp,
-      c.connector_id,          -- ← connector_id is in 'connector' table
-      cs.status,               -- ← No alias needed
-      cs.error_code,
-      cs.error_info,
-      cs.status_timestamp
+      c.connector_id,
+      cs_latest.status as connector_status,
+      cs_latest.error_code,
+      cs_latest.error_info,
+      cs_latest.status_timestamp
     FROM charge_box cb
-    LEFT JOIN connector c 
-      ON c.charge_box_id = cb.charge_box_id  -- ← Correct join key
-    LEFT JOIN connector_status cs 
-      ON cs.connector_pk = c.connector_pk    -- ← Correct join key
+    LEFT JOIN connector c ON c.charge_box_id = cb.charge_box_id
+    LEFT JOIN (
+      SELECT cs1.*
+      FROM connector_status cs1
+      INNER JOIN (
+        SELECT connector_pk, MAX(status_timestamp) as max_ts
+        FROM connector_status
+        GROUP BY connector_pk
+      ) cs2 ON cs1.connector_pk = cs2.connector_pk 
+           AND cs1.status_timestamp = cs2.max_ts
+    ) cs_latest ON cs_latest.connector_pk = c.connector_pk
     WHERE cb.charge_box_id = ?
     ORDER BY c.connector_id
   `, [chargeBoxId]);

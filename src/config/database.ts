@@ -1,30 +1,19 @@
 import mysql from 'mysql2/promise';
-import winston from './logger';
+import winston from './logger.js';
 
 // Read-only connection pool for SteVe database
-// Uses your existing MySQL config with security constraints
 export const steveDb = mysql.createPool({
   host: process.env.STEVE_DB_HOST || 'localhost',
   port: parseInt(process.env.STEVE_DB_PORT || '3306'),
-  user: process.env.STEVE_DB_USER || 'steve_readonly', // ⚠️ Create dedicated read-only user
+  user: process.env.STEVE_DB_USER || 'steve_readonly',
   password: process.env.STEVE_DB_PASSWORD,
   database: 'stevedb',
   
-  // Security & Performance Settings
+  // Core mysql2 PoolOptions (validated by types)
   connectionLimit: 10,
   waitForConnections: true,
-  queueLimit: 0,
   
-  // ⚠️ CRITICAL: Enforce read-only at connection level
-  // Prevents accidental writes to SteVe's operational tables
-  initSql: 'SET SESSION TRANSACTION READ ONLY',
-  
-  // Timeouts to prevent hanging connections
-  connectTimeout: 10000,
-  acquireTimeout: 10000,
-  timeout: 30000,
-  
-  // SSL recommended for production (optional for local dev)
+  // SSL for production (optional for local dev)
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: true } : undefined,
 });
 
@@ -52,15 +41,14 @@ export async function closeSteveConnection(): Promise<void> {
 export async function steveQuery<T>(sql: string, params?: any[]): Promise<T[]> {
   const start = Date.now();
   try {
-    const [rows] = await steveDb.execute<[T[]]>(sql, params || []);
+    const [rows] = await steveDb.execute(sql, params || []);
     const duration = Date.now() - start;
     
-    // Log slow queries (>500ms) for optimization
     if (duration > 500) {
       winston.warn('⚠️ Slow SteVe query detected', { sql, duration, params });
     }
     
-    return rows;
+    return rows as T[];
   } catch (error) {
     winston.error('💥 SteVe query failed', { 
       sql, 

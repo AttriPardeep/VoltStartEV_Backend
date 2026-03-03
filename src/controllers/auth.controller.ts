@@ -1,3 +1,4 @@
+import winston from '../config/logger.js';
 import { Request, Response } from 'express';
 import { validateIdTag } from '../services/ocpp/auth.service';
 import { AuthorizeResponseSchema } from '../types/ocpp-1.6';

@@ -82,20 +82,4 @@ router.get('/:id/metrics', async (req: Request, res: Response) => {
     });
   }
 });
-
-// GET /api/chargers/:id/metrics - Get real-time metrics for charger
-router.get("/:id/metrics", async (req: Request, res: Response) => {
-  try {
-    const { connectorId } = req.query;
-    if (!connectorId) {
-      res.status(400).json({ success: false, error: "Bad request", message: "connectorId query parameter is required" });
-      return;
-    }
-    const metrics = await getConnectorMetrics(req.params.id, parseInt(connectorId as string));
-    res.status(200).json({ success: true, message: "Metrics retrieved successfully", data: metrics });
-  } catch (error) {
-    logger.error(`Failed to fetch metrics for ${req.params.id}`, { error });
-    res.status(500).json({ success: false, error: "Internal server error", message: error instanceof Error ? error.message : "Unknown error" });
-  }
-});
 export default router;

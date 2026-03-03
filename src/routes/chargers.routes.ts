@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { listChargers, getCharger } from '../controllers/chargers.controller';
-import { authenticateJwt } from '../middleware/auth.middleware';
+import { authenticateJwt } from '../middleware/auth.middleware.js';
 
 const router = Router();
 

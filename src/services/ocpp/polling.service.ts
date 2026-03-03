@@ -1,6 +1,6 @@
-import { steveQuery } from '../../config/database';
-import { getWebSocketService } from '../../config/websocket';
-import winston from '../../config/logger';
+import { steveQuery } from '../../config/database.js';
+import { getWebSocketService } from '../../config/websocket.js';
+import winston from '../../config/logger.js';
 
 export class StevePollingService {
   private intervals: NodeJS.Timeout[] = [];
@@ -231,7 +231,7 @@ export class StevePollingService {
       // Emit grouped meter updates
       for (const [chargeBoxId, values] of byCharger) {
         const ws = getWebSocketService();
-        ws.emitMeterValues(chargeBoxId, values);
+        ws.emitMeterValues(chargeBoxId, 0, values);
       }
       
       if (recentMeters.length > 0) {

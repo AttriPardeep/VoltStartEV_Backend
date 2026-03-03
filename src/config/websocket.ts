@@ -1,7 +1,7 @@
 import { Server as SocketIOServer } from 'socket.io';
 import { createServer } from 'http';
 import express from 'express';
-import winston from './logger';
+import winston from './logger.js';
 
 export class WebSocketService {
   private io: SocketIOServer;
@@ -83,7 +83,7 @@ export class WebSocketService {
     });
   }
   
-  getHttpServer() {
+  getHttpServer(): ReturnType<typeof createServer> {
     return this.httpServer;
   }
   
