@@ -1,12 +1,12 @@
-// src/routes/chargers.routes.ts - OCPP 1.6 Compliant Charger Routes
+// src/routes/chargers.routes.ts - OCPP 1.6 Compliant Charger Routes (Simplified Status)
 // ⚠️ THIS IS THE FILE IMPORTED BY server.ts - DO NOT EDIT charger.routes.ts (singular)
 import { Router, Request, Response } from 'express';
-import { getAllChargers, getChargerById, getConnectorMetrics } from '../services/ocpp/steve-adapter.js';
+import { getAllChargers, getChargerStatus, getConnectorMetrics } from '../services/ocpp/steve-adapter.js';
 import logger from '../config/logger.js';
 
 const router = Router();
 
-console.log('🔍 chargers.routes.ts: Loading routes...');
+console.log('🔍 chargers.routes.ts: Loading routes with simplified status model...');
 
 // ─────────────────────────────────────────────────────
 // ⚠️ CRITICAL: Register MORE SPECIFIC routes BEFORE less specific ones
@@ -45,8 +45,7 @@ router.get('/:id/metrics', async (req: Request, res: Response) => {
     console.log(`✅ Metrics found: ${metrics.length} records for ${req.params.id}`);
     
     // Return OCPP 1.6 compliant MeterValues structure
-    // https://ocpp-spec.org/schemas/v1.6/#MeterValue
-      // Return OCPP 1.6 compliant MeterValues structure
+    // https://ocpp-spec.org/schemas/v1.6/#MeterValues
     res.status(200).json({
       success: true,
       message: 'Metrics retrieved successfully',
@@ -54,15 +53,15 @@ router.get('/:id/metrics', async (req: Request, res: Response) => {
         chargeBoxId: req.params.id,
         connectorId: connectorIdNum,
         meterValues: metrics.map((m: any) => ({
-          timestamp: m.timestamp,
+          timestamp: m.timestamp,  // ISO 8601 format
           sampledValue: [{
-            value: String(m.value),
-            context: m.context || 'Sample.Periodic',
-            format: 'Raw',
-            measurand: m.measurand,
-            phase: m.phase,
-            location: m.location,
-            unit: m.unit
+            value: String(m.value),                    // ✅ String per OCPP spec
+            context: m.context || 'Sample.Periodic',   // ✅ ReadingContext enum
+            format: 'Raw',                              // ✅ ValueFormat enum  
+            measurand: m.measurand,                     // ✅ Measurand enum
+            phase: m.phase,                             // ✅ Phase enum (optional)
+            location: m.location,                       // ✅ Location enum (optional)
+            unit: m.unit                                // ✅ UnitOfMeasure enum (optional)
           }]
         }))
       },
@@ -79,48 +78,104 @@ router.get('/:id/metrics', async (req: Request, res: Response) => {
   }
 });
 
-// ✅ GET /api/chargers/:id - Get charger by ID (less specific - registered AFTER /:id/metrics)
+// ✅ GET /api/chargers/:id - Get SIMPLIFIED charger status (user-facing)
+// Returns: Available | Busy | Offline | Faulted | Reserved
 router.get('/:id', async (req: Request, res: Response) => {
-  console.log(`📡 GET /api/chargers/${req.params.id}`);
+  console.log(`📡 GET /api/chargers/${req.params.id} (simplified status)`);
   
   try {
-    const charger = await getChargerById(req.params.id);
+    const { id: chargeBoxId } = req.params;
     
-    if (!charger) {
-      return res.status(404).json({
+    // Validate chargeBoxId
+    if (!chargeBoxId || chargeBoxId.trim() === '') {
+      return res.status(400).json({
         success: false,
-        error: 'Charger not found',
+        error: 'Bad request',
+        message: 'chargeBoxId is required',
         timestamp: new Date().toISOString()
       });
     }
     
+    // Get simplified charger status from SteVe DB
+    const summary = await getChargerStatus(chargeBoxId);
+    
+    // Handle charger not found
+    if (summary.status === 'Unknown' && summary.reason === 'Charger not found') {
+      return res.status(404).json({
+        success: false,
+        error: 'Charger not found',
+        message: `No charger registered with ID: ${chargeBoxId}`,
+        timestamp: new Date().toISOString()
+      });
+    }
+    
+    // Return simplified, user-friendly status
     res.status(200).json({
       success: true,
-      message: 'Charger retrieved successfully',
-       charger,
+      message: 'Charger status retrieved successfully',
+      data: {
+        // Core identification
+        chargeBoxId: summary.chargeBoxId,
+        
+        // Simplified status (user-facing)
+        status: summary.status,  // 'Available' | 'Busy' | 'Offline' | 'Faulted' | 'Reserved'
+        
+        // Optional details for enhanced UX (only include if present)
+        ...(summary.lastSeen && { lastSeen: summary.lastSeen }),
+        ...(summary.availableConnectors !== undefined && { 
+          availableConnectors: summary.availableConnectors,
+          totalConnectors: summary.totalConnectors 
+        }),
+        ...(summary.estimatedWait && { estimatedWaitMinutes: summary.estimatedWait }),
+        ...(summary.errorDetails && { errorDetails: summary.errorDetails }),
+        
+        // Charger capabilities (static metadata)
+        ...(summary.capabilities && { capabilities: summary.capabilities })
+      },
       timestamp: new Date().toISOString()
     });
+    
   } catch (error) {
-    logger.error(`Failed to fetch charger ${req.params.id}`, { error });
+    logger.error(`Failed to fetch charger status for ${req.params.id}`, { 
+      error: error instanceof Error ? error.message : error,
+      stack: error instanceof Error ? error.stack : undefined
+    });
+    
     res.status(500).json({
       success: false,
       error: 'Internal server error',
-      message: error instanceof Error ? error.message : 'Unknown error',
+      message: 'Unable to retrieve charger status. Please try again later.',
       timestamp: new Date().toISOString()
     });
   }
 });
 
-// ✅ GET /api/chargers - List all chargers
+// ✅ GET /api/chargers - List all chargers with simplified status
 router.get('/', async (_req: Request, res: Response) => {
-  console.log('📡 GET /api/chargers');
+  console.log('📡 GET /api/chargers (list with simplified status)');
   
   try {
+    // getAllChargers now returns simplified status summaries
     const chargers = await getAllChargers();
+    
     res.status(200).json({
       success: true,
       message: 'Chargers retrieved successfully',
-       chargers,
+      data: chargers.map(c => ({
+        chargeBoxId: c.chargeBoxId,
+        status: c.status,  // Simplified: 'Available' | 'Busy' | 'Offline' | 'Faulted' | 'Reserved'
+        // Optional details for list view
+        ...(c.availableConnectors !== undefined && {
+          availableConnectors: c.availableConnectors,
+          totalConnectors: c.totalConnectors
+        }),
+        ...(c.estimatedWait && { estimatedWaitMinutes: c.estimatedWait }),
+        // Static metadata for map/list display
+        name: c.name,
+        location: c.location,
+        powerType: c.capabilities?.powerType,
+        maxPower: c.capabilities?.maxPower
+      })),
       timestamp: new Date().toISOString()
     });
   } catch (error) {
@@ -134,5 +189,5 @@ router.get('/', async (_req: Request, res: Response) => {
   }
 });
 
-console.log('✅ chargers.routes.ts: All routes registered (order: / → /:id/metrics → /:id)');
+console.log('✅ chargers.routes.ts: All routes registered with simplified status model');
 export default router;
