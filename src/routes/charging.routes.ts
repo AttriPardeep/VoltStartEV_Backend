@@ -1,14 +1,134 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import { authenticateJwt } from '../middleware/auth.middleware.js';
+import { startChargingSession } from '../services/ocpp/remote-start.service.js';
+import { getChargerStatus } from '../services/ocpp/steve-adapter.js';
+import { validateIdTag } from '../services/ocpp/auth.service.js';
+import logger from '../config/logger.js';
 
 const router = Router();
 
-router.post('/start', authenticateJwt, async (req, res) => {
-  res.json({ success: true, message: 'RemoteStart ready' });
+// POST /api/charging/start - App-initiated charging session
+router.post('/start', authenticateJwt, async (req: Request, res: Response) => {
+  console.log(`⚡ RemoteStart request: chargeBoxId=${req.body.chargeBoxId}, connectorId=${req.body.connectorId}`);
+  
+  try {
+    const { chargeBoxId, connectorId, idTag } = req.body;
+    
+    if (!chargeBoxId || !connectorId || !idTag) {
+      return res.status(400).json({
+        success: false,
+        error: 'Bad request',
+        message: 'chargeBoxId, connectorId, and idTag are required',
+        timestamp: new Date().toISOString()
+      });
+    }
+    
+    const chargerStatus = await getChargerStatus(chargeBoxId);
+    if (chargerStatus.status !== 'Available') {
+      return res.status(409).json({
+        success: false,
+        error: 'Conflict',
+        message: `Charger is ${chargerStatus.status}. Please try another charger.`,
+        timestamp: new Date().toISOString()
+      });
+    }
+    
+    const authResult = await validateIdTag(idTag);
+    if (authResult.status !== 'Accepted') {
+      return res.status(403).json({
+        success: false,
+        error: 'Authorization failed',
+        message: `RFID tag ${idTag} is ${authResult.status}`,
+        timestamp: new Date().toISOString()
+      });
+    }
+    
+    const result = await startChargingSession({
+      chargeBoxId,
+      connectorId: parseInt(connectorId),
+      idTag,
+      userId: (req as any).user?.id
+    });
+    
+    res.status(202).json({
+      success: true,
+      message: 'Charging session initiated',
+      data: {
+        transactionId: result.transactionId,
+        chargeBoxId,
+        connectorId,
+        estimatedStartTime: new Date(Date.now() + 30000).toISOString()
+      },
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    logger.error('RemoteStart failed', { error });
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Unable to start charging session. Please try again.',
+      timestamp: new Date().toISOString()
+    });
+  }
 });
 
-router.post('/stop', authenticateJwt, async (req, res) => {
-  res.json({ success: true, message: 'RemoteStop ready' });
+// POST /api/charging/stop - App-initiated stop charging session
+router.post('/stop', authenticateJwt, async (req: Request, res: Response) => {
+  console.log(`🛑 RemoteStop request: transactionId=${req.body.transactionId}`);
+  
+  try {
+    const { transactionId } = req.body;
+    
+    if (!transactionId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Bad request',
+        message: 'transactionId is required',
+        timestamp: new Date().toISOString()
+      });
+    }
+    
+    res.status(202).json({
+      success: true,
+      message: 'Charging session stop requested',
+      data: {
+        transactionId
+      },
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    logger.error('RemoteStop failed', { error });
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Unable to stop charging session. Please try again.',
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// GET /api/charging/sessions - List active/past sessions for authenticated user
+router.get('/sessions', authenticateJwt, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).user?.id;
+    
+    res.status(200).json({
+      success: true,
+      data: [],
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    logger.error('Failed to fetch sessions', { error });
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Unable to retrieve charging sessions.',
+      timestamp: new Date().toISOString()
+    });
+  }
 });
 
 export default router;

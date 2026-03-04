@@ -10,6 +10,27 @@ export interface AuthorizationResult {
   reason?: string;
 }
 
+export async function validateIdTagForUser(idTag: string, appUserId: number): Promise<AuthorizationResult> {
+  // Check if this RFID tag is assigned to this app user
+  const [link] = await steveQuery<any>(`
+    SELECT 1 FROM user_ocpp_tag
+    WHERE user_pk = ? AND ocpp_tag_pk = (
+      SELECT ocpp_tag_pk FROM ocpp_tag WHERE id_tag = ?
+    )
+    LIMIT 1
+  `, [appUserId, idTag]);
+
+  if (!link) {
+    return {
+      status: 'Invalid',
+      reason: `RFID tag ${idTag} is not assigned to your account`
+    };
+  }
+
+  // Then validate the tag itself (expiry, blocked, etc.)
+  return await validateIdTag(idTag);
+}
+
 /**
  * Validate RFID/App token against SteVe's ocpp_tag + ocpp_tag_activity tables
  * Implements OCPP 1.6 AuthorizationStatus logic per spec Section 4.2

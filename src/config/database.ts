@@ -2,6 +2,8 @@ import mysql from 'mysql2/promise';
 import winston from './logger.js';
 
 // Read-only connection pool for SteVe database
+// src/config/database.ts
+
 export const steveDb = mysql.createPool({
   host: process.env.STEVE_DB_HOST || 'localhost',
   port: parseInt(process.env.STEVE_DB_PORT || '3306'),
@@ -9,12 +11,29 @@ export const steveDb = mysql.createPool({
   password: process.env.STEVE_DB_PASSWORD,
   database: 'stevedb',
   
-  // Core mysql2 PoolOptions (validated by types)
   connectionLimit: 10,
   waitForConnections: true,
   
-  // SSL for production (optional for local dev)
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: true } : undefined,
+  // 🔧 SSL Configuration - Dev overrides take precedence
+  ssl: (() => {
+    // 1. Explicit dev override: allow self-signed certs
+    if (process.env.STEVE_DB_SSL_REJECT_UNAUTHORIZED === 'false') {
+      return { rejectUnauthorized: false } as mysql.SslOptions;
+    }
+    
+    // 2. Explicitly disable SSL entirely
+    if (process.env.STEVE_DB_SSL === 'false') {
+      return undefined;
+    }
+    
+    // 3. Production: require valid certificates
+    if (process.env.NODE_ENV === 'production') {
+      return { rejectUnauthorized: true };
+    }
+    
+    // 4. Default fallback: no SSL for local dev
+    return undefined;
+  })(),
 });
 
 // Health check utility
