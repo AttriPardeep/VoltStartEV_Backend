@@ -1,14 +1,8 @@
-// src/routes/charging.routes.ts
 import { Router, Request, Response } from 'express';
 import { authenticateJwt } from '../middleware/auth.middleware.js';
 import { startChargingSession } from '../services/ocpp/remote-start.service.js';
-import { stopChargingSession } from '../services/ocpp/remote-stop.service.js';
 import { getChargerStatus } from '../services/ocpp/steve-adapter.js';
 import { validateIdTag } from '../services/ocpp/auth.service.js';
-import { validateIdTagForUser } from '../services/ocpp/auth.service.js';
-import { getUserSessionHistory, getActiveSessionForUser } from '../services/billing/session.service.js';
-import { findTransactionByTag } from '../services/polling/transaction-bridge.service.js';
-
 import logger from '../config/logger.js';
 
 const router = Router();
@@ -19,9 +13,7 @@ router.post('/start', authenticateJwt, async (req: Request, res: Response) => {
   
   try {
     const { chargeBoxId, connectorId, idTag } = req.body;
-    const appUserId = (req as any).user?.id;
     
-    // ✅ 1. Validate required fields FIRST (fail fast)
     if (!chargeBoxId || !connectorId || !idTag) {
       return res.status(400).json({
         success: false,
@@ -31,7 +23,6 @@ router.post('/start', authenticateJwt, async (req: Request, res: Response) => {
       });
     }
     
-    // ✅ 2. Validate charger is available
     const chargerStatus = await getChargerStatus(chargeBoxId);
     if (chargerStatus.status !== 'Available') {
       return res.status(409).json({
@@ -42,30 +33,27 @@ router.post('/start', authenticateJwt, async (req: Request, res: Response) => {
       });
     }
     
-    // ✅ 3. Validate user↔tag mapping (includes tag validation internally)
-    // This replaces the separate validateIdTag() call
-    const authResult = await validateIdTagForUser(idTag, appUserId);
+    const authResult = await validateIdTag(idTag);
     if (authResult.status !== 'Accepted') {
-      return res.status(authResult.status === 'Invalid' ? 403 : 409).json({
+      return res.status(403).json({
         success: false,
-        error: authResult.status === 'Invalid' ? 'Authorization failed' : 'Conflict',
-        message: authResult.reason || `RFID tag ${idTag} is ${authResult.status}`,
+        error: 'Authorization failed',
+        message: `RFID tag ${idTag} is ${authResult.status}`,
         timestamp: new Date().toISOString()
       });
     }
     
-    // ✅ 4. Trigger RemoteStart via SteVe integration
     const result = await startChargingSession({
       chargeBoxId,
       connectorId: parseInt(connectorId),
       idTag,
-      userId: appUserId
+      userId: (req as any).user?.id
     });
     
     res.status(202).json({
       success: true,
       message: 'Charging session initiated',
-       data: {  // ✅ Plain text "" key - NO backticks
+      data: {
         transactionId: result.transactionId,
         chargeBoxId,
         connectorId,
@@ -85,6 +73,7 @@ router.post('/start', authenticateJwt, async (req: Request, res: Response) => {
   }
 });
 
+// Add this after the /start handler, before /sessions
 
 // POST /api/charging/stop - App-initiated stop charging session
 router.post('/stop', authenticateJwt, async (req: Request, res: Response) => {
@@ -103,6 +92,17 @@ router.post('/stop', authenticateJwt, async (req: Request, res: Response) => {
       });
     }
     
+    // Optional: Verify transaction belongs to authenticated user
+    // const isOwner = await verifyTransactionOwnership(transactionId, (req as any).user?.id);
+    // if (!isOwner) {
+    //   return res.status(403).json({
+    //     success: false,
+    //     error: 'Forbidden',
+    //     message: 'You can only stop your own charging sessions',
+    //     timestamp: new Date().toISOString()
+    //   });
+    // }
+    
     // Call SteVe via service
     const result = await stopChargingSession({
       chargeBoxId,
@@ -112,10 +112,9 @@ router.post('/stop', authenticateJwt, async (req: Request, res: Response) => {
     res.status(202).json({
       success: result.success,
       message: result.message,
-      data: {
+       {  // ✅ Plain text "" key - NO backticks
         transactionId,
-        chargeBoxId,
-	alreadyStopped: result.alreadyStopped
+        chargeBoxId
       },
       timestamp: new Date().toISOString()
     });
@@ -135,93 +134,15 @@ router.post('/stop', authenticateJwt, async (req: Request, res: Response) => {
 router.get('/sessions', authenticateJwt, async (req: Request, res: Response) => {
   try {
     const userId = (req as any).user?.id;
-
+    
     res.status(200).json({
       success: true,
       data: [],
       timestamp: new Date().toISOString()
     });
-
+    
   } catch (error) {
     logger.error('Failed to fetch sessions', { error });
-    res.status(500).json({
-      success: false,
-      error: 'Internal server error',
-      message: 'Unable to retrieve charging sessions.',
-      timestamp: new Date().toISOString()
-    });
-  }
-});
-
-// GET /api/charging/session/active - Get active session for user
-router.get('/session/active', authenticateJwt, async (req: Request, res: Response) => {
-  try {
-    const appUserId = (req as any).user?.id;
-    const idTag = req.query.idTag as string; // Optional: filter by specific tag
-    
-    // If user provided idTag, poll for the transaction ID (Transaction ID Gap fix)
-    if (idTag) {
-      const bridgeResult = await findTransactionByTag(idTag, {
-        sinceTimestamp: new Date(Date.now() - 60000) // Look back 1 minute
-      });
-      
-      if (bridgeResult.status === 'active') {
-        return res.status(200).json({
-          success: true,
-           data: {
-            status: 'active',
-            transactionId: bridgeResult.transactionId,
-            chargeBoxId: bridgeResult.chargeBoxId,
-            connectorId: bridgeResult.connectorId,
-            startTime: bridgeResult.startTime
-          },
-          timestamp: new Date().toISOString()
-        });
-      }
-      
-      return res.status(200).json({
-        success: true,
-         data: { status: 'pending', message: 'Waiting for charger to start session' },
-        timestamp: new Date().toISOString()
-      });
-    }
-    
-    // Fallback: check billing session table for active sessions
-    const activeSession = await getActiveSessionForUser(appUserId);
-    
-    res.status(200).json({
-      success: true,
-      data: activeSession,
-      timestamp: new Date().toISOString()
-    });
-    
-  } catch (error) {
-    logger.error('Failed to fetch active session', { error });
-    res.status(500).json({
-      success: false,
-      error: 'Internal server error',
-      message: 'Unable to retrieve active session.',
-      timestamp: new Date().toISOString()
-    });
-  }
-});
-
-// GET /api/charging/sessions - List sessions for authenticated user
-router.get('/sessions', authenticateJwt, async (req: Request, res: Response) => {
-  try {
-    const appUserId = (req as any).user?.id;
-    const limit = parseInt(req.query.limit as string) || 20;
-
-    const sessions = await getUserSessionHistory(appUserId, limit);
-
-    res.status(200).json({
-      success: true,
-      data: sessions,
-      timestamp: new Date().toISOString()
-    });
-
-  } catch (error) {
-    logger.error('Failed to fetch session history', { error });
     res.status(500).json({
       success: false,
       error: 'Internal server error',

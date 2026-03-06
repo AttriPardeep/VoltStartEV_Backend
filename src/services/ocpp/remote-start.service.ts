@@ -2,14 +2,16 @@
 import { steveQuery } from '../../config/database.js';
 import logger from '../../config/logger.js';
 
+// ✅ ADD: chargingProfilePk as optional field (per api-docs.json RemoteStartTransactionParams)
 export interface RemoteStartRequest {
   chargeBoxId: string;
   connectorId: number;
-  idTag: string;        // ← User's RFID/App tag (e.g., "USER001")
-  userId?: number;      // ← VoltStartEV app user ID (for audit logging)
+  idTag: string;
+  userId?: number;
+  chargingProfilePk?: number;  // ← ADD THIS: Optional charging profile PK (> 0 to include)
 }
 
-// ✅ Service account credentials (loaded from env vars - NEVER hardcode)
+// Service account credentials (loaded from env vars)
 const STEVE_API_USER = process.env.STEVE_API_USER || 'voltstart_backend';
 const STEVE_API_PASS = process.env.STEVE_API_PASS || 'ServiceSecretKey_2026!';
 
@@ -20,8 +22,8 @@ function getServiceAuthHeader(): Record<string, string> {
 
 export async function startChargingSession(req: RemoteStartRequest): Promise<{ transactionId: number }> {
   logger.info(`🔌 Starting charging session for ${req.chargeBoxId}:${req.connectorId}`, {
-    appUserId: req.userId,      // ← Audit: which app user triggered this
-    idTag: req.idTag,           // ← Which RFID tag is being used
+    appUserId: req.userId,
+    idTag: req.idTag,
     chargeBoxId: req.chargeBoxId
   });
 
@@ -29,23 +31,33 @@ export async function startChargingSession(req: RemoteStartRequest): Promise<{ t
   const steveApiEndpoint = `${steveApiBaseUrl}/api/v1/operations/RemoteStartTransaction`;
   
   try {
-    // ✅ CORRECT request body per SteVe api-docs.json
-    const requestBody = {
-      chargeBoxIdList: [req.chargeBoxId],  // Array with exactly 1 element
-      connectorId: req.connectorId,
-      idTag: req.idTag,                    // ← User's RFID tag (NOT service account)
-      chargingProfilePk: 0
+    // ✅ Build request body per api-docs.json RemoteStartTransactionParams
+    // Required fields only: chargeBoxIdList (array with 1 element), idTag
+    const requestBody: any = {
+      chargeBoxIdList: [req.chargeBoxId],  // Required: array with exactly 1 element
+      idTag: req.idTag                      // Required
     };
+    
+    // Optional fields - only include if they have meaningful values
+    if (req.connectorId !== undefined && req.connectorId >= 0) {
+      requestBody.connectorId = req.connectorId;
+    }
+    
+    // ✅ Only include chargingProfilePk if it's a valid PK (> 0)
+    // Sending 0 causes "Bad Request" because profile ID 0 doesn't exist
+    if (req.chargingProfilePk && req.chargingProfilePk > 0) {
+      requestBody.chargingProfilePk = req.chargingProfilePk;
+    }
     
     logger.debug(`SteVe API request: ${JSON.stringify(requestBody)}`);
     
-    // ✅ Authenticate with SERVICE ACCOUNT, not app user
+    // Authenticate with service account Basic Auth
     const response = await fetch(steveApiEndpoint, {
       method: 'POST',
       headers: { 
         'Content-Type': 'application/json',
         'Accept': 'application/json',
-        ...getServiceAuthHeader()  // ← Service account Basic Auth
+        ...getServiceAuthHeader()
       },
       body: JSON.stringify(requestBody),
       signal: AbortSignal.timeout(10000)

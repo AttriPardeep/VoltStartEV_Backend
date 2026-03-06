@@ -1,115 +1,109 @@
-import { steveQuery } from '../../config/database.js';
+// src/services/ocpp/auth.service.ts
+import { steveQuery } from '../../config/database.js'; 
 import winston from '../../config/logger.js';
 import { AuthorizationStatusSchema } from '../../types/ocpp-1.6';
+import { steveRepository } from '../../repositories/steve-repository.js';
 import { z } from 'zod';
 
+// ✅ ADD: maxActiveTransactions and activeTransactionCount to interface
 export interface AuthorizationResult {
   status: z.infer<typeof AuthorizationStatusSchema>;
   expiryDate?: string;
   parentIdTag?: string;
   reason?: string;
+  userPk?: number;
+  maxActiveTransactions?: number;  //
+  activeTransactionCount?: number; // 
 }
 
-export async function validateIdTagForUser(idTag: string, appUserId: number): Promise<AuthorizationResult> {
-  // Check if this RFID tag is assigned to this app user
-  const [link] = await steveQuery<any>(`
-    SELECT 1 FROM user_ocpp_tag
-    WHERE user_pk = ? AND ocpp_tag_pk = (
-      SELECT ocpp_tag_pk FROM ocpp_tag WHERE id_tag = ?
-    )
-    LIMIT 1
-  `, [appUserId, idTag]);
-
-  if (!link) {
-    return {
-      status: 'Invalid',
-      reason: `RFID tag ${idTag} is not assigned to your account`
+/**
+ * Validate that a specific app user is authorized to use this RFID/App tag
+ */
+export async function validateIdTagForUser(
+  idTag: string, 
+  appUserId: number
+): Promise<AuthorizationResult> {
+  // 1. Validate the tag itself (using repository)
+  const tagValidation = await validateIdTag(idTag);
+  if (tagValidation.status !== 'Accepted') {
+    return tagValidation;
+  }
+  
+  // 2. Check if this app user is linked to this tag (using repository)
+  const isLinked = await steveRepository.isUserTagLinked(appUserId, idTag);
+  
+  if (!isLinked) {
+    return { 
+      status: 'Invalid', 
+      reason: `RFID tag ${idTag} is not assigned to your account`,
+      userPk: tagValidation.userPk
     };
   }
-
-  // Then validate the tag itself (expiry, blocked, etc.)
-  return await validateIdTag(idTag);
+  
+  return {
+    ...tagValidation,
+    status: 'Accepted'
+  };
 }
 
 /**
  * Validate RFID/App token against SteVe's ocpp_tag + ocpp_tag_activity tables
- * Implements OCPP 1.6 AuthorizationStatus logic per spec Section 4.2
  */
 export async function validateIdTag(idTag: string): Promise<AuthorizationResult> {
   try {
-    // Query ocpp_tag + activity + user linkage for full authorization context
-    const [tag] = await steveQuery<any>(`
-      SELECT 
-        ot.ocpp_tag_pk,
-        ot.id_tag,
-        ot.expiry_date,
-        ot.parent_id_tag,
-        ot.max_active_transaction_count,
-        ota.active_transaction_count,
-        ota.in_transaction,
-        ota.blocked,
-        uot.user_pk
-      FROM ocpp_tag ot
-      LEFT JOIN ocpp_tag_activity ota ON ota.ocpp_tag_pk = ot.ocpp_tag_pk
-      LEFT JOIN user_ocpp_tag uot ON uot.ocpp_tag_pk = ot.ocpp_tag_pk
-      WHERE ot.id_tag = ?
-      LIMIT 1
-    `, [idTag]);
+    const tagDetails = await steveRepository.getTagDetails(idTag);
     
-    // ─────────────────────────────────────────────────────
-    // Authorization Decision Tree (OCPP 1.6 Spec)
-    // ─────────────────────────────────────────────────────
-    
-    // 1. Tag not found in system → Invalid
-    if (!tag) {
-      winston.warn(`❌ Authorization failed: idTag '${idTag}' not found in ocpp_tag table`);
+    if (!tagDetails) {
       return { status: 'Invalid', reason: 'Unknown identifier' };
     }
     
-    // 2. Explicitly blocked flag → Blocked
-    if (tag.blocked === 1) {
-      winston.warn(`❌ Authorization failed: idTag '${idTag}' is explicitly blocked`);
+    if (tagDetails.blocked) {
       return { status: 'Blocked', reason: 'Tag administratively blocked' };
     }
     
-    // 3. Expiry date check → Expired
-    if (tag.expiry_date && new Date(tag.expiry_date) < new Date()) {
-      winston.warn(`❌ Authorization failed: idTag '${idTag}' expired on ${tag.expiry_date}`);
+    if (tagDetails.expired) {
       return { 
         status: 'Expired', 
-        expiryDate: new Date(tag.expiry_date).toISOString(),
+        expiryDate: tagDetails.expiryDate,
         reason: 'Tag expiry date passed'
       };
     }
     
-    // 4. Concurrent transaction limit check → ConcurrentTx
-    if (tag.max_active_transaction_count > 0 && 
-        tag.active_transaction_count >= tag.max_active_transaction_count) {
-      winston.warn(`❌ Authorization failed: idTag '${idTag}' at max concurrent transactions (${tag.active_transaction_count}/${tag.max_active_transaction_count})`);
+    if (tagDetails.activeTransactionCount >= tagDetails.maxActiveTransactions) {
       return { 
         status: 'ConcurrentTx',
-        reason: `Max ${tag.max_active_transaction_count} concurrent sessions allowed`
+        reason: `Max ${tagDetails.maxActiveTransactions} concurrent sessions allowed`
       };
     }
     
-    // ✅ All checks passed → Accepted
-    winston.info(`✅ Authorization successful for idTag '${idTag}' | user_pk=${tag.user_pk || 'null'}`);
+    // Fetch userPk separately from user_ocpp_tag
+    const [userLink] = await steveQuery<any>(`
+      SELECT uot.user_pk 
+      FROM user_ocpp_tag uot
+      WHERE uot.ocpp_tag_pk = ?
+      LIMIT 1
+    `, [tagDetails.ocppTagPk]);
+    
     return {
       status: 'Accepted',
-      expiryDate: tag.expiry_date ? new Date(tag.expiry_date).toISOString() : undefined,
-      parentIdTag: tag.parent_id_tag || undefined,
+      userPk: userLink?.user_pk || undefined,
+      expiryDate: tagDetails.expiryDate,
+      parentIdTag: tagDetails.parentIdTag,
+      maxActiveTransactions: tagDetails.maxActiveTransactions, // 
+      activeTransactionCount: tagDetails.activeTransactionCount // 
     };
     
   } catch (error) {
-    winston.error('💥 Error validating idTag', { idTag, error: error instanceof Error ? error.message : error });
-    // Fail closed for security: never authorize on DB error
+    winston.error('Error validating idTag', { 
+      idTag, 
+      error: error instanceof Error ? error.message : error 
+    });
     return { status: 'Invalid', reason: 'System error during validation' };
   }
 }
 
 /**
- * Link app user to OCPP tag for richer authorization context
- * Returns user_pk if tag is linked to a registered user
+ * Get user_pk if tag is linked to a registered user
  */
 export async function getUserIdByTag(idTag: string): Promise<number | null> {
   const [result] = await steveQuery<any>(`
@@ -123,14 +117,13 @@ export async function getUserIdByTag(idTag: string): Promise<number | null> {
 }
 
 /**
- * Update ocpp_tag_activity counters after transaction start/stop
- * ⚠️ Requires write permissions - use only if backend has dedicated write user
+ * Update ocpp_tag_activity counters (optional - SteVe usually handles internally)
  */
 export async function updateTagActivity(
   idTag: string, 
   delta: 1 | -1
 ): Promise<void> {
-  // This is optional: SteVe may handle this internally
+  // Optional: SteVe typically handles this internally via OCPP message handlers
   // Only uncomment if your backend has INSERT/UPDATE permissions on ocpp_tag_activity
   
   /*

@@ -1,119 +1,113 @@
-import 'dotenv/config';
+// src/server.ts
 import express from 'express';
+import { createServer } from 'http';
 import cors from 'cors';
-import helmet from 'helmet';
-import rateLimit from 'express-rate-limit';
+import dotenv from 'dotenv';
+
+// Import routes
+import chargingRoutes from './routes/charging.routes.js';
 import chargersRoutes from './routes/chargers.routes.js';
 import authRoutes from './routes/auth.routes.js';
-import chargingRoutes from './routes/charging.routes.js';
-import { getWebSocketService } from './config/websocket.js';
-import { StevePollingService } from './services/ocpp/polling.service.js';
-import winston from './config/logger.js';
-import { steveDb, testSteveConnection, closeSteveConnection } from './config/database.js';
+
+// Import middleware
+import { errorHandler } from './middleware/error.middleware.js';
+
+// Import database with CORRECT exports
+import { testConnections, closeAllConnections } from './config/database.js'; // ← FIXED
+
+// Import WebSocket service (if implemented)
+// import ChargingWebSocketService from './websocket/charging.websocket.js';
+
+// Load environment variables
+dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Security middleware
-app.use(helmet({
-  contentSecurityPolicy: false, // Disable for API (adjust for production)
-}));
+// Middleware
 app.use(cors({
-  origin: process.env.APP_ORIGIN?.split(',') || 'http://localhost:8081',
-  credentials: true,
+  origin: process.env.CORS_ORIGIN?.split(',') || ['http://localhost:8081', 'http://localhost:3000'],
+  credentials: true
 }));
-
-// Rate limiting
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
-  message: { error: 'Too many requests, please try again later' },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-app.use('/api/', limiter);
-
-// Body parsing
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Health check endpoint (public)
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
+// Request logging
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  next();
+});
+
+// Routes
+app.use('/api/auth', authRoutes);
+app.use('/api/charging', chargingRoutes);
+app.use('/api/chargers', chargersRoutes);
+
+// Health check endpoint
+app.get('/health', async (req, res) => {
+  try {
+    const dbStatus = await testConnections();
+    res.status(200).json({
+      status: 'healthy',
+      database: dbStatus,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(503).json({
+      status: 'unhealthy',
+      error: error instanceof Error ? error.message : 'Unknown error',
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// Error handling middleware
+app.use(errorHandler);
+
+// Create HTTP server
+const server = createServer(app);
+
+// Initialize WebSocket (if implemented)
+// const wsService = new ChargingWebSocketService(server);
+// app.set('websocketService', wsService);
+
+// Start server
+server.listen(PORT, () => {
+  console.log(`
+╔═══════════════════════════════════════════════════════════╗
+║                                                           ║
+║   ⚡ VoltStartEV Backend Started                          ║
+║                                                           ║
+║   Port: ${PORT}                                          ║
+║   Environment: ${process.env.NODE_ENV || 'development'}                    ║
+║   SteVe API: ${process.env.STEVE_API_URL || 'http://localhost:8080/steve'}      ║
+║                                                           ║
+╚═══════════════════════════════════════════════════════════╝
+  `);
+  
+  // Test database connections on startup
+  testConnections();
+});
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('🛑 SIGTERM received. Shutting down gracefully...');
+  server.close(async () => {
+    console.log('🔌 HTTP server closed');
+    await closeAllConnections(); // ← FIXED: was closeSteveConnection
+    console.log('✅ Database connections closed');
+    process.exit(0);
   });
 });
 
-// API Routes
-app.use('/api/auth', authRoutes);
-app.use('/api/chargers', chargersRoutes);
-app.use('/api/charging', chargingRoutes);
-
-// 404 handler
-app.use('*', (req, res) => {
-  res.status(404).json({ error: 'Route not found' });
+process.on('SIGINT', async () => {
+  console.log('🛑 SIGINT received. Shutting down gracefully...');
+  server.close(async () => {
+    console.log('🔌 HTTP server closed');
+    await closeAllConnections();
+    console.log('✅ Database connections closed');
+    process.exit(0);
+  });
 });
 
-// Error handler
-app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
-  winston.error('Unhandled error', { error: err.stack, path: req.path });
-  
-  if (process.env.NODE_ENV === 'production') {
-    res.status(500).json({ error: 'Internal server error' });
-  } else {
-    res.status(500).json({ error: err.message, stack: err.stack });
-  }
-});
-
-// Initialize services
-const wsService = getWebSocketService(app);
-const pollingService = new StevePollingService(5000);
-
-// Graceful shutdown
-let isShuttingDown = false;
-const shutdown = async (signal: string) => {
-  if (isShuttingDown) return;
-  isShuttingDown = true;
-  
-  winston.info(`🛑 ${signal} received, starting graceful shutdown...`);
-  
-  pollingService.stop();
-  await wsService.close();
-  await closeSteveConnection();
-  
-  winston.info('✅ Graceful shutdown complete');
-  process.exit(0);
-};
-
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
-
-// Bootstrap
-async function start() {
-  try {
-    // Verify DB connection
-    const dbOk = await testSteveConnection();
-    if (!dbOk) {
-      throw new Error('SteVe database connection failed');
-    }
-    
-    // Start HTTP + WebSocket server
-    const httpServer = wsService.getHttpServer();
-    httpServer.listen(PORT, () => {
-      winston.info(`🚀 VoltStartEV Backend running on port ${PORT}`);
-      winston.info(`📡 WebSocket server ready`);
-      
-      // Start polling AFTER server is listening
-      pollingService.start();
-      winston.info(`🔄 SteVe polling service started (interval: 5s)`);
-    });
-    
-  } catch (error) {
-    winston.error('💥 Failed to start server', { error });
-    process.exit(1);
-  }
-}
-
-start();
+export default app;

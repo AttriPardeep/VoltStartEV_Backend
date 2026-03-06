@@ -1,79 +1,126 @@
-import mysql from 'mysql2/promise';
-import winston from './logger.js';
-
-// Read-only connection pool for SteVe database
 // src/config/database.ts
+import mysql from 'mysql2/promise';
+import logger from './logger.js';
 
-export const steveDb = mysql.createPool({
+// ─────────────────────────────────────────────────────
+// SteVe Database Connection (READ-ONLY)
+// ─────────────────────────────────────────────────────
+export const stevePool = mysql.createPool({
   host: process.env.STEVE_DB_HOST || 'localhost',
   port: parseInt(process.env.STEVE_DB_PORT || '3306'),
   user: process.env.STEVE_DB_USER || 'steve_readonly',
   password: process.env.STEVE_DB_PASSWORD,
-  database: 'stevedb',
-  
-  connectionLimit: 10,
+  database: process.env.STEVE_DB_NAME || 'stevedb',
   waitForConnections: true,
-  
-  // 🔧 SSL Configuration - Dev overrides take precedence
-  ssl: (() => {
-    // 1. Explicit dev override: allow self-signed certs
-    if (process.env.STEVE_DB_SSL_REJECT_UNAUTHORIZED === 'false') {
-      return { rejectUnauthorized: false } as mysql.SslOptions;
-    }
-    
-    // 2. Explicitly disable SSL entirely
-    if (process.env.STEVE_DB_SSL === 'false') {
-      return undefined;
-    }
-    
-    // 3. Production: require valid certificates
-    if (process.env.NODE_ENV === 'production') {
-      return { rejectUnauthorized: true };
-    }
-    
-    // 4. Default fallback: no SSL for local dev
-    return undefined;
-  })(),
+  connectionLimit: 10,
+  queueLimit: 0,
+  // SSL for development (self-signed certs OK)
+  ssl: process.env.NODE_ENV === 'development' 
+    ? { rejectUnauthorized: false } 
+    : undefined
 });
 
-// Health check utility
-export async function testSteveConnection(): Promise<boolean> {
-  try {
-    const connection = await steveDb.getConnection();
-    await connection.ping();
-    connection.release();
-    winston.info('✅ SteVe database connection successful');
-    return true;
-  } catch (error) {
-    winston.error('❌ SteVe database connection failed', { error: error instanceof Error ? error.message : error });
-    return false;
-  }
-}
+// ─────────────────────────────────────────────────────
+// VoltStartEV App Database Connection (READ/WRITE)
+// ─────────────────────────────────────────────────────
+export const appPool = mysql.createPool({
+  host: process.env.APP_DB_HOST || 'localhost',
+  port: parseInt(process.env.APP_PORT || '3306'),
+  user: process.env.APP_DB_USER || 'voltstartev_user',
+  password: process.env.APP_DB_PASSWORD,
+  database: process.env.APP_DB_NAME || 'voltstartev_db',
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
+});
 
-// Graceful shutdown handler
-export async function closeSteveConnection(): Promise<void> {
-  await steveDb.end();
-  winston.info('🔌 SteVe database pool closed');
-}
+// ─────────────────────────────────────────────────────
+// Query Functions with Logging
+// ─────────────────────────────────────────────────────
 
-// Type-safe query wrapper with logging
-export async function steveQuery<T>(sql: string, params?: any[]): Promise<T[]> {
+export async function steveQuery<T = any>(sql: string, params?: any[]): Promise<T> {
   const start = Date.now();
   try {
-    const [rows] = await steveDb.execute(sql, params || []);
+    const [rows] = await stevePool.execute(sql, params);
     const duration = Date.now() - start;
     
     if (duration > 500) {
-      winston.warn('⚠️ Slow SteVe query detected', { sql, duration, params });
+      logger.warn(`⚠️ Slow SteVe query: ${duration}ms`, { sql: sql.substring(0, 100) });
     }
     
-    return rows as T[];
-  } catch (error) {
-    winston.error('💥 SteVe query failed', { 
-      sql, 
-      error: error instanceof Error ? error.message : error,
-      params 
+    return rows as T;
+  } catch (error: any) {
+    logger.error('💥 SteVe query failed', { 
+      sql: sql.substring(0, 200),
+      error: error.message,
+      code: error.code
     });
     throw error;
   }
 }
+
+export async function appDbQuery<T = any>(sql: string, params?: any[]): Promise<T> {
+  const start = Date.now();
+  try {
+    const [rows] = await appPool.execute(sql, params);
+    const duration = Date.now() - start;
+    
+    if (duration > 500) {
+      logger.warn(`⚠️ Slow app DB query: ${duration}ms`, { sql: sql.substring(0, 100) });
+    }
+    
+    return rows as T;
+  } catch (error: any) {
+    logger.error('💥 App DB query failed', { 
+      sql: sql.substring(0, 200),
+      error: error.message,
+      code: error.code
+    });
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────
+// Health Check & Shutdown
+// ─────────────────────────────────────────────────────
+
+export async function testConnections(): Promise<{ steve: boolean; app: boolean }> {
+  const result = { steve: false, app: false };
+  
+  try {
+    const steveConn = await stevePool.getConnection();
+    await steveConn.ping();
+    steveConn.release();
+    result.steve = true;
+    logger.info('✅ SteVe DB connection OK');
+  } catch (error: any) {
+    logger.error('❌ SteVe DB connection failed', { error: error.message });
+  }
+  
+  try {
+    const appConn = await appPool.getConnection();
+    await appConn.ping();
+    appConn.release();
+    result.app = true;
+    logger.info('✅ App DB connection OK');
+  } catch (error: any) {
+    logger.error('❌ App DB connection failed', { error: error.message });
+  }
+  
+  return result;
+}
+
+// Graceful shutdown
+export async function closeAllConnections(): Promise<void> {
+  logger.info('🔌 Closing database connections...');
+  await Promise.all([
+    stevePool.end(),
+    appPool.end()
+  ]);
+  logger.info('✅ All database connections closed');
+}
+
+process.on('SIGTERM', async () => {
+  await closeAllConnections();
+  process.exit(0);
+});
