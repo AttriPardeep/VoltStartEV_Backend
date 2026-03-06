@@ -1,10 +1,13 @@
 // src/server.ts
+import 'dotenv/config';
+
 import express from 'express';
 import { createServer } from 'http';
 import cors from 'cors';
 import dotenv from 'dotenv';
-
 // Import routes
+//
+import usersRoutes from './routes/users.routes.js';
 import chargingRoutes from './routes/charging.routes.js';
 import chargersRoutes from './routes/chargers.routes.js';
 import authRoutes from './routes/auth.routes.js';
@@ -17,9 +20,6 @@ import { testConnections, closeAllConnections } from './config/database.js'; // 
 
 // Import WebSocket service (if implemented)
 // import ChargingWebSocketService from './websocket/charging.websocket.js';
-
-// Load environment variables
-dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -42,6 +42,7 @@ app.use((req, res, next) => {
 app.use('/api/auth', authRoutes);
 app.use('/api/charging', chargingRoutes);
 app.use('/api/chargers', chargersRoutes);
+app.use('/api/users', usersRoutes);
 
 // Health check endpoint
 app.get('/health', async (req, res) => {

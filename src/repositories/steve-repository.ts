@@ -1,5 +1,6 @@
 // src/repositories/steve-repository.ts
 import { steveQuery } from '../config/database.js';
+import { steveApiService, OcppTagForm, OcppTagOverview } from '../services/steve/steve-api.service.js';
 import logger from '../config/logger.js';
 
 // ─────────────────────────────────────────────────────
@@ -7,7 +8,7 @@ import logger from '../config/logger.js';
 // ─────────────────────────────────────────────────────
 
 export interface IOcppTagRepository {
-  /** Get tag details including activity status */
+  /** Get tag details including activity status (READ: direct SQL for performance) */
   getTagDetails(idTag: string): Promise<{
     ocppTagPk: number;
     idTag: string;
@@ -17,18 +18,22 @@ export interface IOcppTagRepository {
     parentIdTag?: string;
     activeTransactionCount: number;
     maxActiveTransactions: number;
+    userPk?: number;
   } | null>;
-  
+
   /** Check if user is linked to this tag (for app-flow security) */
   isUserTagLinked(appUserId: number, idTag: string): Promise<boolean>;
-  
-  /** Add or update an OCPP tag in SteVe */
+
+  /** Add or update an OCPP tag in SteVe (WRITE: via REST API) */
   upsertTag(params: {
     idTag: string;
     maxActiveTransactions?: number;
     expiryDate?: Date;
     note?: string;
   }): Promise<{ ocppTagPk: number }>;
+
+  /** Check if tag exists via SteVe API */
+  tagExists(idTag: string): Promise<boolean>;
 }
 
 export interface ITransactionRepository {
@@ -44,7 +49,7 @@ export interface ITransactionRepository {
     chargeBoxId: string;
     connectorId: number;
   }>>;
-  
+
   /** Check if a transaction has been stopped */
   isTransactionStopped(transactionPk: number): Promise<boolean>;
 }
@@ -63,7 +68,7 @@ export interface IChargerRepository {
 }
 
 // ─────────────────────────────────────────────────────
-// IMPLEMENTATION: SteVe-specific SQL goes here ONLY
+// IMPLEMENTATION: SteVe-specific logic
 // ─────────────────────────────────────────────────────
 
 export class SteveSqlRepository implements 
@@ -85,6 +90,7 @@ export class SteveSqlRepository implements
     parentIdTag?: string;
     activeTransactionCount: number;
     maxActiveTransactions: number;
+    userPk?: number;
   } | null> {
     const [tag] = await steveQuery(`
       SELECT 
@@ -94,9 +100,11 @@ export class SteveSqlRepository implements
         ot.parent_id_tag,
         ota.blocked,
         ota.active_transaction_count,
-        ot.max_active_transaction_count
+        ot.max_active_transaction_count,
+        uot.user_pk
       FROM ocpp_tag ot
       LEFT JOIN ocpp_tag_activity ota ON ota.ocpp_tag_pk = ot.ocpp_tag_pk
+      LEFT JOIN user_ocpp_tag uot ON uot.ocpp_tag_pk = ot.ocpp_tag_pk
       WHERE ot.id_tag = ?
       LIMIT 1
     `, [idTag]);
@@ -111,7 +119,8 @@ export class SteveSqlRepository implements
       expiryDate: tag.expiry_date ? new Date(tag.expiry_date).toISOString() : undefined,
       parentIdTag: tag.parent_id_tag || undefined,
       activeTransactionCount: tag.active_transaction_count || 0,
-      maxActiveTransactions: tag.max_active_transaction_count || 1
+      maxActiveTransactions: tag.max_active_transaction_count || 1,
+      userPk: tag.user_pk || undefined,
     };
   }
   
@@ -134,30 +143,25 @@ export class SteveSqlRepository implements
   }): Promise<{ ocppTagPk: number }> {
     const { idTag, maxActiveTransactions = 1, expiryDate, note } = params;
     
-    await steveQuery(`
-      INSERT INTO ocpp_tag (
-        id_tag,
-        max_active_transaction_count,
-        expiry_date,
-        note
-      ) VALUES (?, ?, ?, ?)
-      ON DUPLICATE KEY UPDATE 
-        max_active_transaction_count = VALUES(max_active_transaction_count),
-        expiry_date = VALUES(expiry_date),
-        note = VALUES(note),
-        updated_at = NOW()
-    `, [idTag, maxActiveTransactions, expiryDate ?? null, note ?? null]);
+    const apiResult = await steveApiService.getOrCreateTag(idTag, {
+      maxActiveTransactionCount: maxActiveTransactions,
+      expiryDate: expiryDate?.toISOString(),
+      note: note || 'Provisioned by VoltStartEV app',
+    });
     
-    const [tag] = await steveQuery(
-      'SELECT ocpp_tag_pk FROM ocpp_tag WHERE id_tag = ? LIMIT 1',
-      [idTag]
-    );
-    
-    if (!tag) {
-      throw new Error(`Failed to retrieve ocpp_tag_pk for ${idTag}`);
+    if (!apiResult.success || !apiResult.data) {
+      throw new Error(
+        `Failed to provision tag ${idTag} via SteVe API: ${apiResult.error?.message}`
+      );
     }
     
-    return { ocppTagPk: tag.ocpp_tag_pk };
+    logger.info(`✅ Tag provisioned via SteVe API: ${idTag} (PK: ${apiResult.data.ocppTagPk})`);
+    
+    return { ocppTagPk: apiResult.data.ocppTagPk };
+  }
+  
+  async tagExists(idTag: string): Promise<boolean> {
+    return await steveApiService.tagExists(idTag);
   }
   
   // ─────────────────────────────────────────────────
@@ -258,7 +262,7 @@ export class SteveSqlRepository implements
 }
 
 // ─────────────────────────────────────────────────────
-// SINGLETON EXPORT: Use this instance throughout the app
+// SINGLETON EXPORT
 // ─────────────────────────────────────────────────────
 
 export const steveRepository = new SteveSqlRepository();

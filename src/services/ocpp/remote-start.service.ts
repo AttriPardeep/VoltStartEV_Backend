@@ -60,7 +60,7 @@ export async function startChargingSession(req: RemoteStartRequest): Promise<{ t
         ...getServiceAuthHeader()
       },
       body: JSON.stringify(requestBody),
-      signal: AbortSignal.timeout(10000)
+      signal: AbortSignal.timeout(30000) // 30 sec time-out
     });
 
     const responseText = await response.text();

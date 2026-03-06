@@ -7,13 +7,13 @@ import { z } from 'zod';
 
 // ✅ ADD: maxActiveTransactions and activeTransactionCount to interface
 export interface AuthorizationResult {
-  status: z.infer<typeof AuthorizationStatusSchema>;
+  status: z.infer<typeof AuthorizationStatusSchema>; // 'Accepted' | 'Blocked' | 'Expired' | 'ConcurrentTx' | 'Invalid' | 'Unknown'
   expiryDate?: string;
   parentIdTag?: string;
   reason?: string;
   userPk?: number;
-  maxActiveTransactions?: number;  //
-  activeTransactionCount?: number; // 
+  maxActiveTransactions?: number;
+  activeTransactionCount?: number;
 }
 
 /**

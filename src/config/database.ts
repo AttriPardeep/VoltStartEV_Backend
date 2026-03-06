@@ -14,7 +14,6 @@ export const stevePool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
-  // SSL for development (self-signed certs OK)
   ssl: process.env.NODE_ENV === 'development' 
     ? { rejectUnauthorized: false } 
     : undefined
@@ -25,7 +24,7 @@ export const stevePool = mysql.createPool({
 // ─────────────────────────────────────────────────────
 export const appPool = mysql.createPool({
   host: process.env.APP_DB_HOST || 'localhost',
-  port: parseInt(process.env.APP_PORT || '3306'),
+  port: parseInt(process.env.APP_DB_PORT || '3306'),
   user: process.env.APP_DB_USER || 'voltstartev_user',
   password: process.env.APP_DB_PASSWORD,
   database: process.env.APP_DB_NAME || 'voltstartev_db',
@@ -38,6 +37,55 @@ export const appPool = mysql.createPool({
 // Query Functions with Logging
 // ─────────────────────────────────────────────────────
 
+// For SELECT queries - returns array of rows
+export async function appDbQuery<T = any>(sql: string, params?: any[]): Promise<T[]> {
+  const start = Date.now();
+  try {
+    const [rows] = await appPool.execute(sql, params);
+    const duration = Date.now() - start;
+    
+    if (duration > 500) {
+      logger.warn(`⚠️ Slow app DB query: ${duration}ms`, { sql: sql.substring(0, 100) });
+    }
+    
+    return rows as T[];
+  } catch (error: any) {
+    logger.error('💥 App DB query failed', { 
+      sql: sql.substring(0, 200),
+      error: error.message,
+      code: error.code
+    });
+    throw error;
+  }
+}
+
+// For INSERT/UPDATE/DELETE - returns ResultSetHeader directly
+export async function appDbExecute<T = any>(sql: string, params?: any[]): Promise<T> {
+  const start = Date.now();
+  try {
+    const [rows] = await appPool.execute(sql, params);
+    const duration = Date.now() - start;
+    
+    if (duration > 500) {
+      logger.warn(`⚠️ Slow app DB query: ${duration}ms`, { sql: sql.substring(0, 100) });
+    }
+    
+    // For write operations, return the first row (ResultSetHeader) directly
+    if (Array.isArray(rows) && rows.length > 0) {
+      return rows[0] as T;
+    }
+    return rows as T;
+  } catch (error: any) {
+    logger.error('💥 App DB query failed', {
+      sql: sql.substring(0, 200),
+      error: error.message,
+      code: error.code
+    });
+    throw error;
+  }
+}
+
+// For SteVe DB queries (read-only)
 export async function steveQuery<T = any>(sql: string, params?: any[]): Promise<T> {
   const start = Date.now();
   try {
@@ -51,27 +99,6 @@ export async function steveQuery<T = any>(sql: string, params?: any[]): Promise<
     return rows as T;
   } catch (error: any) {
     logger.error('💥 SteVe query failed', { 
-      sql: sql.substring(0, 200),
-      error: error.message,
-      code: error.code
-    });
-    throw error;
-  }
-}
-
-export async function appDbQuery<T = any>(sql: string, params?: any[]): Promise<T> {
-  const start = Date.now();
-  try {
-    const [rows] = await appPool.execute(sql, params);
-    const duration = Date.now() - start;
-    
-    if (duration > 500) {
-      logger.warn(`⚠️ Slow app DB query: ${duration}ms`, { sql: sql.substring(0, 100) });
-    }
-    
-    return rows as T;
-  } catch (error: any) {
-    logger.error('💥 App DB query failed', { 
       sql: sql.substring(0, 200),
       error: error.message,
       code: error.code
@@ -110,7 +137,6 @@ export async function testConnections(): Promise<{ steve: boolean; app: boolean 
   return result;
 }
 
-// Graceful shutdown
 export async function closeAllConnections(): Promise<void> {
   logger.info('🔌 Closing database connections...');
   await Promise.all([

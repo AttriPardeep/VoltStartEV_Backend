@@ -8,6 +8,7 @@ import { validateIdTag } from '../services/ocpp/auth.service.js';
 import { validateIdTagForUser } from '../services/ocpp/auth.service.js';
 import { getUserSessionHistory, getActiveSessionForUser } from '../services/billing/session.service.js';
 import { findTransactionByTag } from '../services/polling/transaction-bridge.service.js';
+import { getSessionSummary } from '../services/billing/session-summary.service.js';
 
 import logger from '../config/logger.js';
 
@@ -19,8 +20,22 @@ router.post('/start', authenticateJwt, async (req: Request, res: Response) => {
   
   try {
     const { chargeBoxId, connectorId, idTag } = req.body;
-    const appUserId = (req as any).user?.id;
-    
+    const appUserId = (req as any).user?.id ?? (process.env.NODE_ENV === 'development' ? 101 : undefined);
+
+// Add this check immediately after:
+if (!appUserId) {
+  logger.error('❌ appUserId is undefined - authentication failed', {
+    env: process.env.NODE_ENV,
+    hasAuthHeader: !!req.headers.authorization,
+    userAgent: req.headers['user-agent']
+  });
+  return res.status(401).json({
+    success: false,
+    error: 'Unauthorized',
+    message: 'User authentication required',
+    timestamp: new Date().toISOString()
+  });
+} 
     // ✅ 1. Validate required fields FIRST (fail fast)
     if (!chargeBoxId || !connectorId || !idTag) {
       return res.status(400).json({
@@ -131,28 +146,6 @@ router.post('/stop', authenticateJwt, async (req: Request, res: Response) => {
   }
 });
 
-// GET /api/charging/sessions - List active/past sessions for authenticated user
-router.get('/sessions', authenticateJwt, async (req: Request, res: Response) => {
-  try {
-    const userId = (req as any).user?.id;
-
-    res.status(200).json({
-      success: true,
-      data: [],
-      timestamp: new Date().toISOString()
-    });
-
-  } catch (error) {
-    logger.error('Failed to fetch sessions', { error });
-    res.status(500).json({
-      success: false,
-      error: 'Internal server error',
-      message: 'Unable to retrieve charging sessions.',
-      timestamp: new Date().toISOString()
-    });
-  }
-});
-
 // GET /api/charging/session/active - Get active session for user
 router.get('/session/active', authenticateJwt, async (req: Request, res: Response) => {
   try {
@@ -226,6 +219,43 @@ router.get('/sessions', authenticateJwt, async (req: Request, res: Response) => 
       success: false,
       error: 'Internal server error',
       message: 'Unable to retrieve charging sessions.',
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// GET /api/charging/sessions/:transactionId - Get detailed session summary
+router.get('/sessions/:transactionId', authenticateJwt, async (req: Request, res: Response) => {
+  try {
+    const transactionId = parseInt(req.params.transactionId);
+    
+    const summary = await getSessionSummary(transactionId, {
+      calculateBilling: true,
+      ratePerKwh: 0.25,
+      sessionFee: 0.50
+    });
+    
+    if (!summary) {
+      return res.status(404).json({
+        success: false,
+        error: 'Not found',
+        message: `Transaction ${transactionId} not found or not completed`,
+        timestamp: new Date().toISOString()
+      });
+    }
+    
+    res.status(200).json({
+      success: true,
+       summary,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error: any) {
+    logger.error('Failed to fetch session summary', { error });
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Unable to retrieve session details.',
       timestamp: new Date().toISOString()
     });
   }

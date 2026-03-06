@@ -790,6 +790,24 @@ class ChargingWebSocketService {
 | `charger:status` | Connector status change | `{chargeBoxId, connectorId, status, timestamp}` |
 | `session:billing` | Billing calculation complete | `{sessionId, energyKwh, totalCost, paymentStatus}` |
 
+#### Frontend Handling of Transaction ID Gap
+
+> ⚠️ **Critical UX Note**: The `transactionId: 0` returned in Step 9 is a placeholder. The real transaction ID is only assigned when the charger sends `StartTransaction` to SteVe.
+
+**Frontend Behavior**:
+1. After receiving `transactionId: 0`, the UI should:
+   - Display "Initiating charging session..."
+   - Disable the "Stop" button
+   - Poll `GET /api/charging/session/active?idTag=USER001` every 3 seconds
+2. When the polling endpoint returns `status: 'active'` with a real `transactionId`:
+   - Update UI to "Charging"
+   - Enable the "Stop" button with the real `transactionId`
+3. Alternatively, listen for the `transaction:started` WebSocket event (Step 11) to get the real ID immediately.
+
+**Backend Endpoint**: `GET /api/charging/session/active`
+- Queries `stevedb.transaction_start` for recent transactions with the given `idTag`
+- Returns `status: 'pending'` while waiting, `status: 'active'` with real `transactionId` when found
+- Timeout: 60 seconds (configurable)
 ---
 
 ## 10. Security Considerations
