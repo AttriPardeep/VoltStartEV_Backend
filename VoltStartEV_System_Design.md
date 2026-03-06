@@ -2001,14 +2001,14 @@ STEVE_DB_HOST=localhost
 STEVE_DB_PORT=3306
 STEVE_DB_NAME=stevedb
 STEVE_DB_USER=voltstartev_user  # SELECT-only permissions
-STEVE_DB_PASSWORD=VoltStartEv@2026Secure!
+STEVE_DB_PASSWORD=<password>
 
 # Database — VoltStartEV App (READ/WRITE)
 APP_DB_HOST=localhost
 APP_DB_PORT=3306
 APP_DB_NAME=voltstartev_db
 APP_DB_USER=voltstartev_user
-APP_DB_PASSWORD=VoltStartEv@2026Secure!
+APP_DB_PASSWORD=<password>
 
 # JWT
 JWT_SECRET=STh0J/t5Wwk2pNNTg4N11bsfNThieH3gkZft9m8gXAE=  # Generate with crypto.randomBytes(32)
@@ -2244,3 +2244,4 @@ Generated OpenAPI spec available at: `/api-docs` (disable in production via `spr
 *Next scheduled review: June 5, 2026*  
 
 ⚡ **VoltStartEV — Powering the Future of EV Charging** ⚡
+
