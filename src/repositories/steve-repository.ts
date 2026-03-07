@@ -37,11 +37,10 @@ export interface IOcppTagRepository {
 }
 
 export interface ITransactionRepository {
-  /** Find recent transaction_start records by tag */
-  findRecentTransactionsByTag(params: {
+  /** Find ACTIVE transaction_start records by tag (started but not stopped) */
+  findActiveTransactionByTag(params: {
     idTag: string;
     chargeBoxId?: string;
-    sinceTimestamp: Date;
     limit?: number;
   }): Promise<Array<{
     transactionPk: number;
@@ -167,11 +166,14 @@ export class SteveSqlRepository implements
   // ─────────────────────────────────────────────────
   // Transaction Methods
   // ─────────────────────────────────────────────────
-  
-  async findRecentTransactionsByTag(params: {
+
+  /**
+   * Find ACTIVE transaction by tag (started but NOT stopped)
+   * Uses LEFT JOIN with transaction_stop to filter out completed sessions
+   */
+  async findActiveTransactionByTag(params: {
     idTag: string;
     chargeBoxId?: string;
-    sinceTimestamp: Date;
     limit?: number;
   }): Promise<Array<{
     transactionPk: number;
@@ -179,9 +181,12 @@ export class SteveSqlRepository implements
     chargeBoxId: string;
     connectorId: number;
   }>> {
-    const { idTag, chargeBoxId, sinceTimestamp, limit = 1 } = params;
-    
-    const rows = await steveQuery(`
+    const { idTag, chargeBoxId, limit = 1 } = params;
+  
+    // 1. Sanitize limit to ensure it's an integer
+    const limitInt = Number(limit) || 1;
+  
+    let sql = `
       SELECT 
         ts.transaction_pk,
         ts.start_timestamp,
@@ -190,16 +195,26 @@ export class SteveSqlRepository implements
       FROM transaction_start ts
       JOIN connector c ON c.connector_pk = ts.connector_pk
       JOIN charge_box cb ON cb.charge_box_id = c.charge_box_id
+      LEFT JOIN transaction_stop tstop ON ts.transaction_pk = tstop.transaction_pk
       WHERE ts.id_tag = ?
-        AND ts.start_timestamp > ?
-        ${chargeBoxId ? 'AND cb.charge_box_id = ?' : ''}
-      ORDER BY ts.start_timestamp DESC
-      LIMIT ?
-    `, chargeBoxId 
-      ? [idTag, sinceTimestamp, chargeBoxId, limit] 
-      : [idTag, sinceTimestamp, limit]
-    );
+        AND tstop.transaction_pk IS NULL
+    `;
     
+    const args: any[] = [idTag];
+    
+    if (chargeBoxId) {
+      sql += ` AND cb.charge_box_id = ?`;
+      args.push(chargeBoxId);
+    }
+    
+    // ✅ FIX: Inline the limit as a number. 
+    // Do NOT use '?' for LIMIT to avoid type issues with prepared statements.
+    sql += ` ORDER BY ts.start_timestamp DESC LIMIT ${limitInt}`;
+    
+    // Note: We do NOT push limit to args anymore
+  
+    const rows = await steveQuery(sql, args);
+  
     return rows.map((row: any) => ({
       transactionPk: row.transaction_pk,
       startTimestamp: row.start_timestamp,
@@ -207,7 +222,7 @@ export class SteveSqlRepository implements
       connectorId: row.connector_id
     }));
   }
-  
+
   async isTransactionStopped(transactionPk: number): Promise<boolean> {
     const [stop] = await steveQuery(
       'SELECT 1 FROM transaction_stop WHERE transaction_pk = ? LIMIT 1',

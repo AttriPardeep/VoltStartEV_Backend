@@ -10,6 +10,7 @@ import { getUserSessionHistory, getActiveSessionForUser } from '../services/bill
 import { findTransactionByTag } from '../services/polling/transaction-bridge.service.js';
 import { getSessionSummary } from '../services/billing/session-summary.service.js';
 import { JwtPayload } from '../middleware/auth.middleware.js';
+import { steveRepository } from '../repositories/steve-repository.js'; // ← ADD THIS
 
 import logger from '../config/logger.js';
 
@@ -150,31 +151,33 @@ router.post('/stop', authenticateJwt, async (req: Request, res: Response) => {
 // GET /api/charging/session/active - Get active session for user
 router.get('/session/active', authenticateJwt, async (req: Request, res: Response) => {
   try {
-    const reqWithUser = req as Request & { user?: JwtPayload };
+    const reqWithUser = req as Request & { user?: JwtPayload };	  
     const appUserId = reqWithUser.user?.id;
     if (!appUserId) {
       return res.status(401).json({
        success: false,
        message: "User not authenticated"
       });
-    }    
-    const idTag = req.query.idTag as string; // Optional: filter by specific tag
-    
-    // If user provided idTag, poll for the transaction ID (Transaction ID Gap fix)
+    }
+    const idTag = req.query.idTag as string;
+
+    // If user provided idTag, find ACTIVE transaction (not just recent)
     if (idTag) {
-      const bridgeResult = await findTransactionByTag(idTag, {
-        sinceTimestamp: new Date(Date.now() - 60000) // Look back 1 minute
+      const activeTxs = await steveRepository.findActiveTransactionByTag({
+        idTag,
+        // chargeBoxId: req.query.chargeBoxId as string // optional, only if filtering by charger
       });
       
-      if (bridgeResult.status === 'active') {
+      if (activeTxs.length > 0) {
+        const tx = activeTxs[0];
         return res.status(200).json({
           success: true,
-           data: {
+          data: {
             status: 'active',
-            transactionId: bridgeResult.transactionId,
-            chargeBoxId: bridgeResult.chargeBoxId,
-            connectorId: bridgeResult.connectorId,
-            startTime: bridgeResult.startTime
+            transactionId: tx.transactionPk,
+            chargeBoxId: tx.chargeBoxId,
+            connectorId: tx.connectorId,
+            startTime: tx.startTimestamp
           },
           timestamp: new Date().toISOString()
         });
@@ -182,20 +185,21 @@ router.get('/session/active', authenticateJwt, async (req: Request, res: Respons
       
       return res.status(200).json({
         success: true,
-         data: { status: 'pending', message: 'Waiting for charger to start session' },
+        data: { 
+          status: 'pending', 
+          message: 'No active session found for this tag' 
+        },
         timestamp: new Date().toISOString()
       });
     }
-    
     // Fallback: check billing session table for active sessions
     const activeSession = await getActiveSessionForUser(appUserId);
-    
+
     res.status(200).json({
       success: true,
       data: activeSession,
       timestamp: new Date().toISOString()
     });
-    
   } catch (error) {
     logger.error('Failed to fetch active session', { error });
     res.status(500).json({

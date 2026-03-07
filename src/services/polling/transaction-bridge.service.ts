@@ -49,10 +49,9 @@ export async function findTransactionByTag(
   const sinceTimestamp = options?.sinceTimestamp ?? new Date(Date.now() - timeoutSeconds * 1000);
   
   try {
-    const transactions = await steveRepository.findRecentTransactionsByTag({
+    const transactions = await steveRepository.findActiveTransactionByTag({
       idTag,
       chargeBoxId: options?.chargeBoxId,
-      sinceTimestamp,
       limit: 1
     });
     
