@@ -9,6 +9,7 @@ import { validateIdTagForUser } from '../services/ocpp/auth.service.js';
 import { getUserSessionHistory, getActiveSessionForUser } from '../services/billing/session.service.js';
 import { findTransactionByTag } from '../services/polling/transaction-bridge.service.js';
 import { getSessionSummary } from '../services/billing/session-summary.service.js';
+import { JwtPayload } from '../middleware/auth.middleware.js';
 
 import logger from '../config/logger.js';
 
@@ -20,22 +21,22 @@ router.post('/start', authenticateJwt, async (req: Request, res: Response) => {
   
   try {
     const { chargeBoxId, connectorId, idTag } = req.body;
-    const appUserId = (req as any).user?.id ?? (process.env.NODE_ENV === 'development' ? 101 : undefined);
+    const reqWithUser = req as Request & { user?: JwtPayload };
+    const appUserId = reqWithUser.user?.id;
 
-// Add this check immediately after:
-if (!appUserId) {
-  logger.error('❌ appUserId is undefined - authentication failed', {
-    env: process.env.NODE_ENV,
-    hasAuthHeader: !!req.headers.authorization,
-    userAgent: req.headers['user-agent']
-  });
-  return res.status(401).json({
-    success: false,
-    error: 'Unauthorized',
-    message: 'User authentication required',
-    timestamp: new Date().toISOString()
-  });
-} 
+    if (!appUserId) {
+      logger.error('❌ appUserId is undefined - authentication failed', {
+        env: process.env.NODE_ENV,
+        hasAuthHeader: !!req.headers.authorization,
+        userAgent: req.headers['user-agent']
+      });
+      return res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'User authentication required',
+        timestamp: new Date().toISOString()
+      });
+    } 
     // ✅ 1. Validate required fields FIRST (fail fast)
     if (!chargeBoxId || !connectorId || !idTag) {
       return res.status(400).json({
@@ -149,7 +150,14 @@ router.post('/stop', authenticateJwt, async (req: Request, res: Response) => {
 // GET /api/charging/session/active - Get active session for user
 router.get('/session/active', authenticateJwt, async (req: Request, res: Response) => {
   try {
-    const appUserId = (req as any).user?.id;
+    const reqWithUser = req as Request & { user?: JwtPayload };
+    const appUserId = reqWithUser.user?.id;
+    if (!appUserId) {
+      return res.status(401).json({
+       success: false,
+       message: "User not authenticated"
+      });
+    }    
     const idTag = req.query.idTag as string; // Optional: filter by specific tag
     
     // If user provided idTag, poll for the transaction ID (Transaction ID Gap fix)
@@ -202,9 +210,15 @@ router.get('/session/active', authenticateJwt, async (req: Request, res: Respons
 // GET /api/charging/sessions - List sessions for authenticated user
 router.get('/sessions', authenticateJwt, async (req: Request, res: Response) => {
   try {
-    const appUserId = (req as any).user?.id;
+    const reqWithUser = req as Request & { user?: JwtPayload };
+    const appUserId = reqWithUser.user?.id;
+    if (!appUserId) {
+      return res.status(401).json({
+       success: false,
+       message: "User not authenticated"
+      });
+    }
     const limit = parseInt(req.query.limit as string) || 20;
-
     const sessions = await getUserSessionHistory(appUserId, limit);
 
     res.status(200).json({

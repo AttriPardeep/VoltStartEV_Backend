@@ -1,26 +1,27 @@
 // src/server.ts
-import 'dotenv/config';
+import 'dotenv/config'; // ← MUST be first import
 
 import express from 'express';
 import { createServer } from 'http';
 import cors from 'cors';
-import dotenv from 'dotenv';
+
 // Import routes
-//
-import usersRoutes from './routes/users.routes.js';
 import chargingRoutes from './routes/charging.routes.js';
 import chargersRoutes from './routes/chargers.routes.js';
 import authRoutes from './routes/auth.routes.js';
+import usersRoutes from './routes/users.routes.js';
 
 // Import middleware
 import { errorHandler } from './middleware/error.middleware.js';
 
-// Import database with CORRECT exports
-import { testConnections, closeAllConnections } from './config/database.js'; // ← FIXED
+// Import database
+import { testConnections, closeAllConnections } from './config/database.js';
 
-// Import WebSocket service (if implemented)
-// import ChargingWebSocketService from './websocket/charging.websocket.js';
+// ✅ Import WebSocket service
+import ChargingWebSocketService from './websocket/charging.websocket.js';
+import { setWebSocketService } from './services/polling/transaction-bridge.service.js';
 
+// Load environment variables (already loaded by dotenv/config above)
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -40,9 +41,9 @@ app.use((req, res, next) => {
 
 // Routes
 app.use('/api/auth', authRoutes);
+app.use('/api/users', usersRoutes);
 app.use('/api/charging', chargingRoutes);
 app.use('/api/chargers', chargersRoutes);
-app.use('/api/users', usersRoutes);
 
 // Health check endpoint
 app.get('/health', async (req, res) => {
@@ -51,6 +52,9 @@ app.get('/health', async (req, res) => {
     res.status(200).json({
       status: 'healthy',
       database: dbStatus,
+      websocket: {
+        connected: wsService?.getConnectedCount() || 0
+      },
       timestamp: new Date().toISOString()
     });
   } catch (error) {
@@ -68,9 +72,9 @@ app.use(errorHandler);
 // Create HTTP server
 const server = createServer(app);
 
-// Initialize WebSocket (if implemented)
-// const wsService = new ChargingWebSocketService(server);
-// app.set('websocketService', wsService);
+// ✅ Initialize WebSocket service
+const wsService = new ChargingWebSocketService(server);
+setWebSocketService(wsService); // Register with polling service
 
 // Start server
 server.listen(PORT, () => {
@@ -82,6 +86,8 @@ server.listen(PORT, () => {
 ║   Port: ${PORT}                                          ║
 ║   Environment: ${process.env.NODE_ENV || 'development'}                    ║
 ║   SteVe API: ${process.env.STEVE_API_URL || 'http://localhost:8080/steve'}      ║
+║   WebSocket: ws://localhost:${PORT}/ws/charging              ║
+║   Connected Clients: ${wsService.getConnectedCount()}                        ║
 ║                                                           ║
 ╚═══════════════════════════════════════════════════════════╝
   `);
@@ -95,7 +101,8 @@ process.on('SIGTERM', async () => {
   console.log('🛑 SIGTERM received. Shutting down gracefully...');
   server.close(async () => {
     console.log('🔌 HTTP server closed');
-    await closeAllConnections(); // ← FIXED: was closeSteveConnection
+    wsService.close(); // Close WebSocket connections
+    await closeAllConnections();
     console.log('✅ Database connections closed');
     process.exit(0);
   });
@@ -105,6 +112,7 @@ process.on('SIGINT', async () => {
   console.log('🛑 SIGINT received. Shutting down gracefully...');
   server.close(async () => {
     console.log('🔌 HTTP server closed');
+    wsService.close();
     await closeAllConnections();
     console.log('✅ Database connections closed');
     process.exit(0);

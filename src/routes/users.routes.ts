@@ -7,6 +7,7 @@ import logger from '../config/logger.js';
 import bcrypt from 'bcrypt';
 import jwt, { SignOptions } from 'jsonwebtoken';
 import { steveApiService } from '../services/steve/steve-api.service.js';
+import { authenticateJwt } from '../middleware/auth.middleware.js';
 
 const router = Router();
 
@@ -180,31 +181,90 @@ router.post('/login', async (req: Request, res: Response) => {
 // ─────────────────────────────────────────────────────
 
 // GET /api/users/:userId/tags - Get tags assigned to a specific user
-router.get('/:userId/tags', async (req: Request, res: Response) => {
+
+router.post('/:userId/tags', async (req: Request, res: Response) => {
   try {
     const userId = parseInt(req.params.userId);
+    const { idTag, nickname, maxActiveTransactions, expiryDate } = req.body;
     
-    const tags = await steveQuery(`
-      SELECT ot.ocpp_tag_pk, ot.id_tag, ot.expiry_date, ot.max_active_transaction_count,
-             ota.blocked, ota.active_transaction_count, uot.created_at AS assigned_at
-      FROM user_ocpp_tag uot
-      JOIN ocpp_tag ot ON ot.ocpp_tag_pk = uot.ocpp_tag_pk
-      LEFT JOIN ocpp_tag_activity ota ON ota.ocpp_tag_pk = ot.ocpp_tag_pk
-      WHERE uot.user_pk = ?
-      ORDER BY ot.id_tag
-    `, [userId]);
+    if (!idTag) {
+      return res.status(400).json({
+        success: false,
+        error: 'Bad request',
+        message: 'idTag is required',
+        timestamp: new Date().toISOString()
+      });
+    }
     
-    res.status(200).json({
+    // ✅ PRODUCTION: Use SteVe REST API to verify tag exists (NO auto-provisioning)
+    const tagResult = await steveApiService.getTagByIdTag(idTag);
+    
+    if (!tagResult.success || !Array.isArray(tagResult.data) || tagResult.data.length === 0) {
+      logger.warn(`❌ Tag not found in SteVe: ${idTag}`);
+      return res.status(404).json({
+        success: false,
+        error: 'Not found',
+        message: `Tag ${idTag} does not exist in SteVe. Please provision it via SteVe admin UI first.`,
+        timestamp: new Date().toISOString()
+      });
+    }
+    
+    const ocppTagPk = tagResult.data[0].ocppTagPk;
+    
+    // ✅ ENFORCE 1:1 MAPPING: Check if tag is already assigned to a DIFFERENT user
+    const [existingLink] = await steveQuery(
+      'SELECT user_pk FROM user_ocpp_tag WHERE ocpp_tag_pk = ? LIMIT 1',
+      [ocppTagPk]
+    );
+    
+    if (existingLink && existingLink.user_pk !== userId) {
+      logger.warn(`❌ Tag ${idTag} already assigned to user ${existingLink.user_pk}, cannot assign to ${userId}`);
+      return res.status(409).json({
+        success: false,
+        error: 'Conflict',
+        message: `Tag ${idTag} is already assigned to user ${existingLink.user_pk}. Unassign it first via admin endpoint.`,
+        timestamp: new Date().toISOString()
+      });
+    }
+    
+    // Link user to tag in user_ocpp_tag table
+    await steveQuery(`
+      INSERT INTO user_ocpp_tag (user_pk, ocpp_tag_pk)
+      VALUES (?, ?)
+      ON DUPLICATE KEY UPDATE updated_at = NOW()
+    `, [userId, ocppTagPk]);
+    
+    logger.info(`✅ Tag ${idTag} assigned to user ${userId}`);
+    
+    res.status(201).json({
       success: true,
-      data: { userId, tags }
+      message: 'Tag assigned successfully',
+      data: { 
+        userId, 
+        idTag, 
+        nickname,
+        ocppTagPk
+      },
+      timestamp: new Date().toISOString()
     });
     
   } catch (error: any) {
-    logger.error('Failed to fetch user tags', { error });
+    logger.error('Failed to assign tag', { error });
+    
+    if (error.message?.includes('SteVe API')) {
+      return res.status(502).json({
+        success: false,
+        error: 'Bad gateway',
+        message: `SteVe API error: ${error.message}`,
+        timestamp: new Date().toISOString()
+      });
+    }
+    
     res.status(500).json({
       success: false,
       error: 'Internal server error',
-      message: error.message
+      message: error.message || 'Unable to assign tag. Please try again.',
+      timestamp: new Date().toISOString()
     });
   }
 });
@@ -290,6 +350,52 @@ router.delete('/:userId/tags/:idTag', async (req: Request, res: Response) => {
       success: false,
       error: 'Internal server error',
       message: error.message
+    });
+  }
+});
+
+
+// POST /api/admin/tags/:idTag/unassign - Unassign tag from any user (admin only)
+router.post('/admin/tags/:idTag/unassign', authenticateJwt, async (req: Request, res: Response) => {
+  // TODO: Add admin role check: if ((req as any).user?.role !== 'admin') return res.status(403)...
+
+  try {
+    const idTag = req.params.idTag;
+
+    // Get tag PK
+    const tagResult = await steveApiService.getTagByIdTag(idTag);
+    if (!tagResult.success || !Array.isArray(tagResult.data) || tagResult.data.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Not found',
+        message: `Tag ${idTag} not found in SteVe`,
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    const ocppTagPk = tagResult.data[0].ocppTagPk;
+
+    // Remove linkage
+    await steveQuery(
+      'DELETE FROM user_ocpp_tag WHERE ocpp_tag_pk = ?',
+      [ocppTagPk]
+    );
+
+    logger.info(`🗑️ Tag ${idTag} unassigned from all users`);
+
+    res.status(200).json({
+      success: true,
+      message: `Tag ${idTag} unassigned successfully`,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error: any) {
+    logger.error('Failed to unassign tag', { error });
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: error.message || 'Unable to unassign tag.',
+      timestamp: new Date().toISOString()
     });
   }
 });

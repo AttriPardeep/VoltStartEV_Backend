@@ -1,36 +1,65 @@
+// src/middleware/auth.middleware.ts
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
-import winston from '../config/logger.js';
 import logger from '../config/logger.js';
 
-export const authenticateJwt = (req: Request, res: Response, next: NextFunction): void => {
-  // Skip auth in development for testing
-   if (process.env.NODE_ENV === 'development' && !req.headers.authorization) {
-    req.user = { 
-      id: String(101), 
-      username: 'test-user', 
-      role: 'customer',
-      iat: Math.floor(Date.now() / 1000),
-      exp: Math.floor(Date.now() / 1000) + 3600
-    };
-    logger.debug('⚠️ Dev mode: injected mock user', { userId: req.user.id });
-    return next();
-  }
+export interface JwtPayload {
+  id: number;
+  username: string;
+  role: string;
+  iat: number;
+  exp: number;
+}
 
-  const authHeader = req.headers.authorization;
-  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+// ✅ Simple approach: Don't extend Request, use type assertion in routes
+export const authenticateJwt = (req: Request, res: Response, next: NextFunction) => {
+  const authHeader = req.headers['authorization'];
   
-  if (!token) {
-    res.status(401).json({ error: 'Missing authentication token' });
-    return;
+  if (!authHeader?.startsWith('Bearer ')) {
+    logger.warn('❌ Missing or invalid Authorization header', {
+      path: req.path,
+      method: req.method,
+      hasAuthHeader: !!authHeader
+    });
+    return res.status(401).json({
+      success: false,
+      error: 'Unauthorized',
+      message: 'Authorization header with Bearer token is required',
+      timestamp: new Date().toISOString()
+    });
   }
+  
+  const token = authHeader.substring(7);
   
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'dev-secret');
-    (req as any).user = decoded;
+    const payload = jwt.verify(token, process.env.JWT_SECRET!) as JwtPayload;
+    
+    if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
+      logger.warn('❌ JWT token expired', { userId: payload.id });
+      return res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'Token has expired',
+        timestamp: new Date().toISOString()
+      });
+    }
+    
+    // ✅ Attach to req with type assertion (no interface extension)
+    (req as any).user = payload;
     next();
-  } catch (error) {
-    winston.warn('❌ JWT verification failed');
-    res.status(401).json({ error: 'Invalid token' });
+    
+  } catch (error: any) {
+    logger.warn('❌ JWT verification failed', {
+      error: error.name,
+      message: error.message,
+      path: req.path
+    });
+    
+    return res.status(401).json({
+      success: false,
+      error: 'Unauthorized',
+      message: 'Invalid or expired token',
+      timestamp: new Date().toISOString()
+    });
   }
 };
