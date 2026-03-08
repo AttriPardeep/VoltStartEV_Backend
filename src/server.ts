@@ -1,27 +1,24 @@
 // src/server.ts
-import 'dotenv/config'; // ← MUST be first import
-
+import 'dotenv/config';
 import express from 'express';
 import { createServer } from 'http';
 import cors from 'cors';
-
 // Import routes
 import chargingRoutes from './routes/charging.routes.js';
 import chargersRoutes from './routes/chargers.routes.js';
 import authRoutes from './routes/auth.routes.js';
 import usersRoutes from './routes/users.routes.js';
-
 // Import middleware
 import { errorHandler } from './middleware/error.middleware.js';
-
 // Import database
 import { testConnections, closeAllConnections } from './config/database.js';
-
-// ✅ Import WebSocket service
+// Import WebSocket services
 import ChargingWebSocketService from './websocket/charging.websocket.js';
 import { setWebSocketService } from './services/polling/transaction-bridge.service.js';
+import { websocketEmitter } from './services/websocket/emitter.service.js';
 
-// Load environment variables (already loaded by dotenv/config above)
+import logger from './config/logger.js';
+// Load environment variables
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -53,7 +50,7 @@ app.get('/health', async (req, res) => {
       status: 'healthy',
       database: dbStatus,
       websocket: {
-        connected: wsService?.getConnectedCount() || 0
+        connected: websocketEmitter.getConnectedCount?.() || 0
       },
       timestamp: new Date().toISOString()
     });
@@ -69,12 +66,17 @@ app.get('/health', async (req, res) => {
 // Error handling middleware
 app.use(errorHandler);
 
-// Create HTTP server
+// Create HTTP server FIRST
 const server = createServer(app);
 
-// ✅ Initialize WebSocket service
+// Initialize WebSocket service AFTER server is created
 const wsService = new ChargingWebSocketService(server);
-setWebSocketService(wsService); // Register with polling service
+
+// Register WebSocket service with polling bridge and emitter
+setWebSocketService(wsService);
+websocketEmitter.registerWebSocketService(wsService);
+
+logger.info('📡 WebSocket services registered');
 
 // Start server
 server.listen(PORT, () => {
@@ -87,7 +89,6 @@ server.listen(PORT, () => {
 ║   Environment: ${process.env.NODE_ENV || 'development'}                    ║
 ║   SteVe API: ${process.env.STEVE_API_URL || 'http://localhost:8080/steve'}      ║
 ║   WebSocket: ws://localhost:${PORT}/ws/charging              ║
-║   Connected Clients: ${wsService.getConnectedCount()}                        ║
 ║                                                           ║
 ╚═══════════════════════════════════════════════════════════╝
   `);

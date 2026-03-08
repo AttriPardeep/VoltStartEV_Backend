@@ -11,6 +11,7 @@ import { findTransactionByTag } from '../services/polling/transaction-bridge.ser
 import { getSessionSummary } from '../services/billing/session-summary.service.js';
 import { JwtPayload } from '../middleware/auth.middleware.js';
 import { steveRepository } from '../repositories/steve-repository.js'; // ← ADD THIS
+import { websocketEmitter } from '../services/websocket/emitter.service.js';
 
 import logger from '../config/logger.js';
 
@@ -151,7 +152,7 @@ router.post('/stop', authenticateJwt, async (req: Request, res: Response) => {
 // GET /api/charging/session/active - Get active session for user
 router.get('/session/active', authenticateJwt, async (req: Request, res: Response) => {
   try {
-    const reqWithUser = req as Request & { user?: JwtPayload };	  
+    const reqWithUser = req as Request & { user?: JwtPayload };   
     const appUserId = reqWithUser.user?.id;
     if (!appUserId) {
       return res.status(401).json({
@@ -165,14 +166,22 @@ router.get('/session/active', authenticateJwt, async (req: Request, res: Respons
     if (idTag) {
       const activeTxs = await steveRepository.findActiveTransactionByTag({
         idTag,
-        // chargeBoxId: req.query.chargeBoxId as string // optional, only if filtering by charger
+        // chargeBoxId: req.query.chargeBoxId as string // optional
       });
       
       if (activeTxs.length > 0) {
         const tx = activeTxs[0];
+        
+        // ✅ Emit WebSocket event via emitter service
+        websocketEmitter.emitTransactionStarted(appUserId, {
+          ...tx,
+          idTag // Add idTag from params
+        });
+        
+        // Return HTTP response - ✅ FIX: Add "data:" key
         return res.status(200).json({
           success: true,
-          data: {
+          data: {  // 
             status: 'active',
             transactionId: tx.transactionPk,
             chargeBoxId: tx.chargeBoxId,
@@ -183,18 +192,20 @@ router.get('/session/active', authenticateJwt, async (req: Request, res: Respons
         });
       }
       
+      // No active transaction found - ✅ FIX: Add "data:" key
       return res.status(200).json({
         success: true,
-        data: { 
+        data: {  
           status: 'pending', 
           message: 'No active session found for this tag' 
         },
         timestamp: new Date().toISOString()
       });
     }
+    
     // Fallback: check billing session table for active sessions
     const activeSession = await getActiveSessionForUser(appUserId);
-
+    
     res.status(200).json({
       success: true,
       data: activeSession,
@@ -210,7 +221,6 @@ router.get('/session/active', authenticateJwt, async (req: Request, res: Respons
     });
   }
 });
-
 // GET /api/charging/sessions - List sessions for authenticated user
 router.get('/sessions', authenticateJwt, async (req: Request, res: Response) => {
   try {
