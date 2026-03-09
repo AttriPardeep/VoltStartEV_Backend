@@ -46,6 +46,40 @@ export function emitChargerStatus(chargeBoxId: string, status: string, transacti
   });
 }
 
+export function emitTelemetryUpdate(userId: number, telemetry: any) {
+  if (!wsService) return false;
+  
+  // Build payload with all available telemetry fields
+  const payload: any = {
+    transactionId: telemetry.transactionId,
+    chargeBoxId: telemetry.chargeBoxId,
+    connectorId: telemetry.connectorId,
+    timestamp: telemetry.timestamp,
+    // Always include energy
+    energyKwh: telemetry.energyKwh ?? 0
+  };
+  
+  // Conditionally include other fields if they exist
+  if (telemetry.powerW !== undefined) payload.powerW = telemetry.powerW;
+  if (telemetry.currentA !== undefined) payload.currentA = telemetry.currentA;
+  if (telemetry.voltageV !== undefined) payload.voltageV = telemetry.voltageV;
+  if (telemetry.socPercent !== undefined) payload.socPercent = telemetry.socPercent;
+  if (telemetry.frequencyHz !== undefined) payload.frequencyHz = telemetry.frequencyHz;
+  
+  // Include any dynamic measurands
+  const excludedKeys = ['transactionId', 'chargeBoxId', 'connectorId', 'timestamp', 
+                        'energyKwh', 'powerW', 'currentA', 'voltageV', 
+                        'socPercent', 'frequencyHz'];
+  
+  for (const [key, value] of Object.entries(telemetry)) {
+    if (!excludedKeys.includes(key) && value !== undefined) {
+      payload[key] = value;
+    }
+  }
+  
+  return wsService.emitToUser(userId, 'telemetry:update', payload);
+}
+
 export function getConnectedCount(): number {
   if (!wsService) return 0;
   return typeof wsService.getConnectedCount === 'function'
@@ -59,5 +93,6 @@ export const websocketEmitter = {
   emitTransactionStarted,
   emitTransactionCompleted,
   emitChargerStatus,
+  emitTelemetryUpdate,
   getConnectedCount
 };

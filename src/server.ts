@@ -16,6 +16,8 @@ import { testConnections, closeAllConnections } from './config/database.js';
 import ChargingWebSocketService from './websocket/charging.websocket.js';
 import { setWebSocketService } from './services/polling/transaction-bridge.service.js';
 import { websocketEmitter } from './services/websocket/emitter.service.js';
+import telemetryRoutes from './routes/telemetry.routes.js';
+import { startReconciliationJob } from './jobs/reconciliation.job.js';
 
 import logger from './config/logger.js';
 // Load environment variables
@@ -41,6 +43,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/users', usersRoutes);
 app.use('/api/charging', chargingRoutes);
 app.use('/api/chargers', chargersRoutes);
+app.use('/api/telemetry', telemetryRoutes);
 
 // Health check endpoint
 app.get('/health', async (req, res) => {
@@ -75,7 +78,7 @@ const wsService = new ChargingWebSocketService(server);
 // Register WebSocket service with polling bridge and emitter
 setWebSocketService(wsService);
 websocketEmitter.registerWebSocketService(wsService);
-
+startReconciliationJob();
 logger.info('📡 WebSocket services registered');
 
 // Start server

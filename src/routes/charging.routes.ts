@@ -10,8 +10,9 @@ import { getUserSessionHistory, getActiveSessionForUser } from '../services/bill
 import { findTransactionByTag } from '../services/polling/transaction-bridge.service.js';
 import { getSessionSummary } from '../services/billing/session-summary.service.js';
 import { JwtPayload } from '../middleware/auth.middleware.js';
-import { steveRepository } from '../repositories/steve-repository.js'; // ← ADD THIS
+import { steveRepository } from '../repositories/steve-repository.js';  
 import { websocketEmitter } from '../services/websocket/emitter.service.js';
+import { meterValueRepository } from '../repositories/meter-value.repository.js';
 
 import logger from '../config/logger.js';
 
@@ -169,29 +170,32 @@ router.get('/session/active', authenticateJwt, async (req: Request, res: Respons
         // chargeBoxId: req.query.chargeBoxId as string // optional
       });
       
-      if (activeTxs.length > 0) {
-        const tx = activeTxs[0];
-        
-        // ✅ Emit WebSocket event via emitter service
-        websocketEmitter.emitTransactionStarted(appUserId, {
-          ...tx,
-          idTag // Add idTag from params
-        });
-        
-        // Return HTTP response - ✅ FIX: Add "data:" key
-        return res.status(200).json({
-          success: true,
-          data: {  // 
-            status: 'active',
-            transactionId: tx.transactionPk,
-            chargeBoxId: tx.chargeBoxId,
-            connectorId: tx.connectorId,
-            startTime: tx.startTimestamp
-          },
-          timestamp: new Date().toISOString()
-        });
-      }
-      
+     
+     if (activeTxs.length > 0) {
+       const tx = activeTxs[0];
+  
+       //  Fetch full telemetry from connector_meter_value
+       const telemetry = await meterValueRepository.getLatestTelemetry(tx.transactionPk);
+  
+       //  Emit WebSocket event with full telemetry
+       if (telemetry) {
+         websocketEmitter.emitTelemetryUpdate(appUserId, telemetry);
+       }
+  
+       // Return HTTP response with telemetry included
+       return res.status(200).json({
+         success: true,
+         data: {
+           status: 'active',
+           transactionId: tx.transactionPk,
+           chargeBoxId: tx.chargeBoxId,
+           connectorId: tx.connectorId,
+           startTime: tx.startTimestamp,
+           telemetry: telemetry || null // Include in HTTP response too
+         },
+       timestamp: new Date().toISOString()
+       });
+      } 
       // No active transaction found - ✅ FIX: Add "data:" key
       return res.status(200).json({
         success: true,
