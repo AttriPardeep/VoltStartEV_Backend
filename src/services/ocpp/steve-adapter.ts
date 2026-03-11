@@ -1,8 +1,9 @@
 // src/services/ocpp/steve-adapter.ts
 // Simplified Charger Status Model for VoltStartEV Backend
 import { steveQuery } from '../../config/database.js';
-import winston from '../../config/logger.js';
+import logger from '../../config/logger.js'; // ✅ FIX: Import logger instance, not winston
 import { ChargePointStatusSchema } from '../../types/ocpp-1.6';
+import { handleStatusNotification, handleStartTransaction, handleStopTransaction } from './ocpp-message-handler.js';
 import { z } from 'zod';
 
 // ─────────────────────────────────────────────────────
@@ -215,6 +216,7 @@ export async function getAllChargers(): Promise<ChargerSummary[]> {
   return summaries;
 }
 
+
 // ─────────────────────────────────────────────────────
 // DETAILED: Get charger with full connector details (optional advanced use)
 // ─────────────────────────────────────────────────────
@@ -343,4 +345,110 @@ export async function isChargerOnline(chargeBoxId: string, timeoutMinutes = 5): 
   const diffMinutes = (now - lastHeartbeat) / (1000 * 60);
   
   return diffMinutes <= timeoutMinutes;
+}
+
+// ─────────────────────────────────────────────────────
+// OCPP Message Handler Registration
+// Call this when initializing your SteVe WebSocket connection
+// ─────────────────────────────────────────────────────
+
+/**
+ * Register OCPP message callbacks with SteVe WebSocket client
+ */
+export function registerOCPPMessageHandlers(steveWebSocketClient: any) {
+  // Handle incoming OCPP messages from chargers via SteVe
+  steveWebSocketClient.on('message', (message: string) => {
+    try {
+      const ocppMsg = JSON.parse(message);
+
+      // OCPP Call format: [2, messageId, action, payload]
+      if (Array.isArray(ocppMsg) && ocppMsg[0] === 2) {
+        const [, messageId, action, payload] = ocppMsg;
+        
+        // ✅ FIX: Extract chargeBoxId from WebSocket URL or session metadata
+        const chargeBoxId = extractChargeBoxIdFromSession(steveWebSocketClient);
+        
+        logger.debug(`📡 OCPP ${action} from ${chargeBoxId}: ${JSON.stringify(payload).substring(0, 200)}...`);
+
+        switch (action) {
+          case 'StatusNotification':
+            handleStatusNotification(chargeBoxId, payload.connectorId, payload);
+            break;
+
+          case 'StartTransaction':
+            // Get SteVe transaction_pk from DB for this StartTransaction
+            getTransactionPkFromSteVe(chargeBoxId, payload)
+              .then(transactionPk => {
+                if (transactionPk) {
+                  handleStartTransaction(chargeBoxId, payload.connectorId, payload, transactionPk);
+                } else {
+                  logger.warn(`⚠️ Could not resolve transaction_pk for StartTransaction on ${chargeBoxId}`);
+                }
+              })
+              .catch(err => logger.error('Failed to resolve transaction_pk', { err }));
+            break;
+
+          case 'StopTransaction':
+            getTransactionPkFromSteVe(chargeBoxId, payload)
+              .then(transactionPk => {
+                if (transactionPk) {
+                  handleStopTransaction(chargeBoxId, payload.connectorId, payload, transactionPk);
+                } else {
+                  logger.warn(`⚠️ Could not resolve transaction_pk for StopTransaction on ${chargeBoxId}`);
+                }
+              })
+              .catch(err => logger.error('Failed to resolve transaction_pk', { err }));
+            break;
+
+          // Handle other OCPP messages as needed
+          default:
+            logger.debug(`📡 Unhandled OCPP action: ${action}`);
+        }
+      }
+    } catch (error) {
+      logger.error('Failed to process OCPP message', { error, rawMessage: message });
+    }
+  });
+
+  logger.info('✅ OCPP message handlers registered');
+}
+
+// Helper: Extract chargeBoxId from WebSocket session
+function extractChargeBoxIdFromSession(client: any): string {
+  // Strategy 1: Check client.url (common in ws library)
+  if (client.url) {
+    const match = client.url.match(/CentralSystemService\/([^/?]+)/);
+    if (match && match[1]) return match[1];
+  }
+  
+  // Strategy 2: Check client.chargeBoxId if set by your WebSocket wrapper
+  if (client.chargeBoxId) return client.chargeBoxId;
+  
+  // Strategy 3: Check session metadata if available
+  if (client.session?.chargeBoxId) return client.session.chargeBoxId;
+  
+  logger.warn('⚠️ Could not extract chargeBoxId from WebSocket session');
+  return 'unknown';
+}
+
+// Helper: Get SteVe transaction_pk for a Start/StopTransaction
+async function getTransactionPkFromSteVe(chargeBoxId: string, payload: any): Promise<number | undefined> {
+  try {
+    const [tx] = await steveQuery(`
+      SELECT ts.transaction_pk
+      FROM transaction_start ts
+      JOIN connector c ON c.connector_pk = ts.connector_pk
+      WHERE c.charge_box_id = ? 
+        AND c.connector_id = ?
+        AND ts.id_tag = ?
+        AND ts.start_timestamp >= DATE_SUB(NOW(), INTERVAL 5 MINUTE)
+      ORDER BY ts.start_timestamp DESC
+      LIMIT 1
+    `, [chargeBoxId, payload.connectorId, payload.idTag]);
+
+    return tx?.transaction_pk;
+  } catch (error) {
+    logger.error('Failed to lookup transaction_pk', { chargeBoxId, payload, error });
+    return undefined;
+  }
 }

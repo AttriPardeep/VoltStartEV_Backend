@@ -221,12 +221,10 @@ export class ReconciliationService {
         end_time,
         start_meter_value,
         end_meter_value,
-        energy_kwh,
-        total_cost,
         status,
         stop_reason,
         payment_status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `, [
       appUserId,
       steveTx.transactionPk,
@@ -237,8 +235,6 @@ export class ReconciliationService {
       steveTx.stopTimestamp || null,
       steveTx.startValue ? parseFloat(steveTx.startValue) : null,
       steveTx.stopValue ? parseFloat(steveTx.stopValue) : null,
-      energyKwh,
-      totalCost,
       steveTx.stopTimestamp ? 'completed' : 'active',
       steveTx.stopReason || null,
       steveTx.stopTimestamp ? 'pending' : null
@@ -262,8 +258,6 @@ export class ReconciliationService {
       SET 
         end_time = ?,
         end_meter_value = ?,
-        energy_kwh = ?,
-        total_cost = ?,
         status = 'completed',
         stop_reason = ?,
         payment_status = 'pending',
@@ -272,8 +266,6 @@ export class ReconciliationService {
     `, [
       steveTx.stopTimestamp,
       steveTx.stopValue ? parseFloat(steveTx.stopValue) : null,
-      energyKwh,
-      totalCost,
       steveTx.stopReason || null,
       sessionId
     ]);

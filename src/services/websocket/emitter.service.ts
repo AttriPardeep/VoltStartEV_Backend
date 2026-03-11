@@ -1,5 +1,6 @@
 // src/services/websocket/emitter.service.ts
 import logger from '../../config/logger.js';
+import { ConnectorStatus, ConnectorErrorCode } from '../../types/ocpp-statuses.js';
 
 let wsService: any = null;
 
@@ -19,7 +20,8 @@ export function emitTransactionStarted(userId: number, transaction: any) {
     chargeBoxId: transaction.chargeBoxId,
     connectorId: transaction.connectorId,
     idTag: transaction.idTag,
-    startTime: transaction.startTimestamp
+    startTime: transaction.startTimestamp,
+    meterStart: transaction.meterStart
   });
 }
 
@@ -29,21 +31,57 @@ export function emitTransactionCompleted(userId: number, transaction: any) {
   return wsService.emitToUser(userId, 'transaction:completed', {
     transactionId: transaction.transactionPk,
     chargeBoxId: transaction.chargeBoxId,
+    connectorId: transaction.connectorId,
     stopTime: transaction.stopTimestamp,
+    stopReason: transaction.stopReason,
+    meterStop: transaction.meterStop,
     energyKwh: transaction.energyKwh,
     totalCost: transaction.totalCost
   });
 }
 
-export function emitChargerStatus(chargeBoxId: string, status: string, transactionId?: number) {
+/**
+ * Emit charger status update to all subscribed clients
+ * Supports detailed OCPP 1.6 status information
+ */
+export function emitChargerStatus(
+  chargeBoxId: string, 
+  connectorId: string | number, 
+  status: ConnectorStatus,
+  details?: {
+    errorCode?: ConnectorErrorCode;
+    errorInfo?: string;
+    timestamp?: string;
+    transactionId?: number;
+    idTag?: string;
+  }
+): number {
   if (!wsService) return 0;
   
-  return wsService.emitToChargeBox(chargeBoxId, 'charger:status', {
+  const connectorIdNum = typeof connectorId === 'string' 
+    ? parseInt(connectorId, 10) 
+    : connectorId;
+  
+  // Build payload with core fields
+  const payload: any = {
     chargeBoxId,
+    connectorId: connectorIdNum,
     status,
-    transactionId,
-    timestamp: new Date().toISOString()
-  });
+    timestamp: details?.timestamp || new Date().toISOString()
+  };
+  
+  // Add optional details if provided
+  if (details?.errorCode) payload.errorCode = details.errorCode;
+  if (details?.errorInfo) payload.errorInfo = details.errorInfo;
+  if (details?.transactionId) payload.activeTransactionId = details.transactionId;
+  if (details?.idTag) payload.activeIdTag = details.idTag;
+  
+  // Emit to charger subscribers (anyone subscribed to this charger)
+  const subscriberCount = wsService.emitToChargeBox(chargeBoxId, 'charger:status', payload);
+  
+  logger.debug(`📤 Emitted charger:status to ${subscriberCount} subscribers: ${chargeBoxId}:${connectorIdNum} = ${status}`);
+  
+  return subscriberCount;
 }
 
 export function emitTelemetryUpdate(userId: number, telemetry: any) {
