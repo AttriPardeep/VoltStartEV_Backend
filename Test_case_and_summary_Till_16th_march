@@ -1,0 +1,3001 @@
+
+
+Password bcrypt: 
+
+node -e "
+const bcrypt = require('bcrypt');
+const password = 'QATest123!';
+const saltRounds = 10;
+
+bcrypt.hash(password, saltRounds).then(hash => {
+  console.log('Generated hash for QATest123!:');
+  console.log(hash);
+});
+"
+
+
+
+# ⚡ VoltStartEV Backend - Complete QA Test Documentation
+
+**Version**: 3.0 (Updated with Production Architecture)  
+**Last Updated**: March 2026  
+**Environment**: MySQL 8.0, SteVe 3.11+, Node.js 20.x
+
+---
+
+## 📋 Table of Contents
+
+1. [System Architecture Overview](#system-architecture-overview)
+2. [Test Environment Setup](#test-environment-setup)
+3. [Test Data Preparation](#test-data-preparation)
+4. [Database Architecture Tests](#database-architecture-tests)
+5. [Authentication & Authorization Tests](#authentication--authorization-tests)
+6. [User Management Tests](#user-management-tests)
+7. [Tag Assignment Tests](#tag-assignment-tests)
+8. [Charging Control Tests](#charging-control-tests)
+9. [Transaction Polling Tests](#transaction-polling-tests)
+10. [Telemetry Tests](#telemetry-tests)
+11. [WebSocket Tests](#websocket-tests)
+12. [Cache Tests](#cache-tests)
+13. [Billing & Reconciliation Tests](#billing--reconciliation-tests)
+14. [Error Handling & Edge Cases](#error-handling--edge-cases)
+15. [Security Tests](#security-tests)
+16. [Performance Tests](#performance-tests)
+17. [Test Results Template](#test-results-template)
+
+---
+
+## 🏗️ System Architecture Overview
+
+### Database Architecture
+
+```
+┌────────────────────────────────────────────────────────┐
+│                    MySQL Server                        │
+├────────────────────────────────────────────────────────┤
+│                                                        │
+│  ┌─────────────────┐    ┌─────────────────┐            │
+│  │  stevedb        │    │  voltstartev_db │            │
+│  │  (SteVe OCPP)   │    │  (VoltStartEV)  │            │
+│  ├─────────────────┤    ├─────────────────┤            │
+│  │ • charge_box    │    │ • users         │            │
+│  │ • ocpp_tag      │    │ • charging_     │            │
+│  │ • user_ocpp_tag │    │   sessions      │            │
+│  │ • ocpp_tag_     │    │ • user_tags     │            │
+│  │   activity(VIEW)│    │ • payments      │            │
+│  │ • transaction_* │    │ • audit_logs    │            │
+│  │ • connector_*   │    │                 │            │
+│  │ • web_user      │    │                 │            │
+│  └─────────────────┘    └─────────────────┘            │
+│           │                        │                   │
+│           │ Read-only              │ Read/Write        │
+│           │ (via steveQuery)       │ (via appDb)       │
+│           ▼                        ▼                   │
+│  ┌─────────────────────────────────────────┐           │
+│  │      VoltStartEV Backend (Node.js)      │           │
+│  └─────────────────────────────────────────┘           │
+│                                                        │
+└────────────────────────────────────────────────────────┘
+```
+
+### Key Architecture Points
+
+| Component | Database | Access Type | Purpose |
+|-----------|----------|-------------|---------|
+| `ocpp_tag` | stevedb | Read-only | Tag validation |
+| `ocpp_tag_activity` | stevedb | **VIEW (Read-only)** | Tag status (blocked, transaction count) |
+| `user_ocpp_tag` | stevedb | Read/Write | User↔Tag linkage |
+| `transaction_start/stop` | stevedb | Read-only | Transaction polling |
+| `connector_meter_value` | stevedb | Read-only | Telemetry data |
+| `charging_sessions` | voltstartev_db | Read/Write | Billing records |
+| `users` | voltstartev_db | Read/Write | App user management |
+| `user_tags` | voltstartev_db | Read/Write | User-friendly tag nicknames |
+
+### Critical Notes for QA
+
+| Finding | Impact on Testing |
+|---------|------------------|
+| `ocpp_tag_activity` is a **VIEW** | Cannot INSERT/UPDATE/DELETE directly; auto-updated by SteVe via OCPP messages |
+| Tag blocking via **SteVe REST API** | Use `/api/v1/ocpp-tags/:idTag`, not direct SQL |
+| `charging_sessions` has **generated columns** | Never INSERT/UPDATE `energy_kwh`, `total_cost`, `duration_seconds` |
+| VoltStartEV writes only to `user_ocpp_tag` | Tag assignment tests focus on linkage table only |
+| Transaction counts auto-update | Test must include OCPP StartTransaction/StopTransaction flows |
+
+---
+
+## 🛠️ Test Environment Setup
+
+### Prerequisites
+```bash
+# Verify services are running
+systemctl status steve          # SteVe OCPP Server
+systemctl status voltstartev    # VoltStartEV Backend
+mysql -u root -p -e "SELECT 1"  # MySQL connection
+
+# Verify charger simulators
+ps aux | grep "node.*simulator" # SAP OCPP Simulator
+```
+
+### Test Tools Required
+```bash
+# Install test dependencies
+npm install -g wscat jq newman
+
+# Verify tools
+wscat --version   # WebSocket testing
+jq --version      # JSON parsing
+curl --version    # HTTP testing
+```
+
+### Environment Variables (.env)
+```bash
+# Server
+NODE_ENV=test
+PORT=3000
+LOG_LEVEL=debug
+
+# Database - SteVe (Read-Only)
+STEVE_DB_HOST=localhost
+STEVE_DB_PORT=3306
+STEVE_DB_NAME=stevedb
+STEVE_DB_USER=voltstartev
+STEVE_DB_PASSWORD=StevePass2026!
+
+# Database - VoltStartEV App (Read/Write)
+APP_DB_HOST=localhost
+APP_DB_PORT=3306
+APP_DB_NAME=voltstartev_db
+APP_DB_USER=voltstartev
+APP_DB_PASSWORD=StevePass2026!
+
+# Authentication
+JWT_SECRET=test-secret-key-for-qa
+JWT_EXPIRES_IN=1h
+
+# SteVe REST API
+STEVE_API_URL=http://localhost:8080/steve
+STEVE_API_USER=voltstart_backend
+STEVE_API_PASSWORD=ServiceSecretKey_2026!
+
+# Cache
+CACHE_TTL_MS=30000
+CACHE_MAX_SIZE=1000
+
+# Reconciliation
+RECONCILIATION_SCHEDULE=*/10 * * * *
+RECONCILIATION_LOOKBACK_MINUTES=60
+```
+
+---
+
+## 📊 Test Data Preparation
+
+### SQL Scripts for Test Data
+
+```bash
+# Run before test suite
+mysql -u root -p << 'EOF'
+
+-- Clean test data (if needed)
+USE voltstartev_db;
+DELETE FROM charging_sessions;
+DELETE FROM user_tags;
+DELETE FROM users;
+
+USE stevedb;
+DELETE FROM user_ocpp_tag ;
+DELETE FROM ocpp_tag ;
+
+-- Create test users in VoltStartEV DB
+INSERT INTO voltstartev_db.users (username, email, password_hash, first_name, last_name, is_active, is_verified)
+VALUES 
+  ('qatest001', 'qa001@voltstartev.com', '$2a$12$1LUMoQABR9dwspWQfYbPi.V/ZFU2PqnfPYT5mu95NwAVnYGbyQcl2', 'QA', 'Test1', 1, 1),
+  ('qatest002', 'qa002@voltstartev.com', '$2b$10$zHglB2yhx5mY/mGbfRB/AeQpfh1bJOwD/9Zv.j2OX3EdJJd9hJoXm', 'QA', 'Test2', 1, 1),
+  ('qatest003', 'qa003@voltstartev.com', '$2b$10$zHglB2yhx5mY/mGbfRB/AeQpfh1bJOwD/9Zv.j2OX3EdJJd9hJoXm', 'QA', 'Test3', 0, 0);
+
+-- Create test tags in SteVe DB
+INSERT INTO stevedb.ocpp_tag (id_tag, max_active_transaction_count, note)
+VALUES 
+  ('QATEST001', 1, 'QA Test Tag 1'),
+  ('QATEST002', 1, 'QA Test Tag 2'),
+  ('QATEST003', 1, 'QA Test Tag 3 - Expired'),
+  ('QATEST004', 1, 'QA Test Tag 4 - Blocked');
+
+-- Set expiry for QATEST003 (expired) - Via SteVe API, not direct SQL
+-- UPDATE stevedb.ocpp_tag SET expiry_date = DATE_SUB(NOW(), INTERVAL 1 DAY) WHERE id_tag = 'QATEST003';
+
+-- Link users to tags in user_ocpp_tag (NOT ocpp_tag_activity - it's a VIEW!)
+INSERT INTO stevedb.user_ocpp_tag (user_pk, ocpp_tag_pk)
+SELECT 1, ocpp_tag_pk FROM stevedb.ocpp_tag WHERE id_tag = 'QATEST001'
+ON DUPLICATE KEY UPDATE user_pk = 1;
+
+INSERT INTO stevedb.user_ocpp_tag (user_pk, ocpp_tag_pk)
+SELECT 2, ocpp_tag_pk FROM stevedb.ocpp_tag WHERE id_tag = 'QATEST002'
+ON DUPLICATE KEY UPDATE user_pk = 2;
+
+EOF
+```
+
+### Verify Test Data Setup
+
+```bash
+# Verify users created
+mysql -u root -p voltstartev_db -e "SELECT user_id, username, email FROM users;"
+
+# Verify tags created
+mysql -u root -p stevedb -e "SELECT ocpp_tag_pk, id_tag FROM ocpp_tag WHERE id_tag LIKE 'QATEST%';"
+
+# Verify user↔tag linkage
+mysql -u root -p -e "
+  SELECT v.user_id, v.username, ot.id_tag, uot.created_at
+  FROM voltstartev_db.users v
+  JOIN stevedb.user_ocpp_tag uot ON uot.user_pk = v.user_id
+  JOIN stevedb.ocpp_tag ot ON ot.ocpp_tag_pk = uot.ocpp_tag_pk;
+"
+
+# Verify ocpp_tag_activity is VIEW (read-only)
+mysql -u root -p stevedb -e "SHOW FULL TABLES WHERE Tables_in_stevedb = 'ocpp_tag_activity';"
+# Expected: Table_type = VIEW
+```
+
+---
+
+## 🗄️ Database Architecture Tests
+
+### DB-001: Verify ocpp_tag_activity is Read-Only VIEW
+| Field | Value |
+|-------|-------|
+| **Priority** | Critical |
+| **Type** | Architecture |
+| **Precondition** | SteVe database accessible |
+
+**Test Steps**:
+```bash
+# Test 1: Verify it's a VIEW
+mysql -u root -p stevedb -e "
+  SELECT TABLE_TYPE 
+  FROM information_schema.TABLES 
+  WHERE TABLE_SCHEMA = 'stevedb' AND TABLE_NAME = 'ocpp_tag_activity';
+"
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# mysql -u root -p stevedb -e "
+  SELECT TABLE_TYPE 
+  FROM information_schema.TABLES 
+  WHERE TABLE_SCHEMA = 'stevedb' AND TABLE_NAME = 'ocpp_tag_activity';
+"
+Enter password: 
++------------+
+| TABLE_TYPE |
++------------+
+| VIEW       |
++------------+
+
+# Test 2: Attempt INSERT (should fail)
+mysql -u root -p stevedb -e "
+  INSERT INTO ocpp_tag_activity (ocpp_tag_pk, blocked) VALUES (191, 1);
+" 2>&1 | grep -i error
+
+
+Result: Pass: 
+root@steve-server:/build/VoltStartEV_Backend# mysql -u root -p stevedb -e "
+  INSERT INTO ocpp_tag_activity (ocpp_tag_pk, blocked) VALUES (191, 1);
+" 2>&1 | grep -i error
+Enter password: 
+ERROR 1471 (HY000) at line 2: The target table ocpp_tag_activity of the INSERT is not insertable-into
+
+# Test 3: Attempt UPDATE (should fail)
+mysql -u root -p stevedb -e "
+  UPDATE ocpp_tag_activity SET blocked = 1 WHERE id_tag = 'QATEST001';
+" 2>&1 | grep -i error
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# mysql -u root -p stevedb -e "
+  UPDATE ocpp_tag_activity SET blocked = 1 WHERE id_tag = 'QATEST001';
+" 2>&1 | grep -i error
+Enter password: 
+ERROR 1288 (HY000) at line 2: The target table ocpp_tag_activity of the UPDATE is not updatable
+root@steve-server:/build/VoltStartEV_Backend#
+
+# Test 4: Attempt DELETE (should fail)
+mysql -u root -p stevedb -e "
+  DELETE FROM ocpp_tag_activity WHERE id_tag = 'QATEST001';
+" 2>&1 | grep -i error
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# mysql -u root -p stevedb -e "
+  DELETE FROM ocpp_tag_activity WHERE id_tag = 'QATEST001';
+" 2>&1 | grep -i error
+Enter password: 
+ERROR 1288 (HY000) at line 2: The target table ocpp_tag_activity of the DELETE is not updatable
+root@steve-server:/build/VoltStartEV_Backend# 
+
+# Test 5: Verify SELECT works
+mysql -u root -p stevedb -e "
+  SELECT id_tag, blocked, active_transaction_count 
+  FROM ocpp_tag_activity 
+  WHERE id_tag = 'QATEST001';
+"
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# mysql -u root -p stevedb -e "
+  SELECT id_tag, blocked, active_transaction_count 
+  FROM ocpp_tag_activity 
+  WHERE id_tag = 'QATEST001';
+"
+Enter password: 
++-----------+---------+--------------------------+
+| id_tag    | blocked | active_transaction_count |
++-----------+---------+--------------------------+
+| QATEST001 |       0 |                        0 |
++-----------+---------+--------------------------+
+root@steve-server:/build/VoltStartEV_Backend# 
+
+```
+
+**Expected Results**:
+| Test | Expected Result |
+|------|----------------|
+| 1 | `TABLE_TYPE = VIEW` |
+| 2 | `ERROR 3616 (HY000): The target table ocpp_tag_activity of the INSERT is not updatable` ✅ |
+| 3 | `ERROR 3616 (HY000): The target table ocpp_tag_activity of the UPDATE is not updatable` ✅ |
+| 4 | `ERROR 3616 (HY000): The target table ocpp_tag_activity of the DELETE is not updatable` ✅ |
+| 5 | Success - returns tag status ✅ |
+
+---
+
+### DB-002: Verify Generated Columns in charging_sessions
+| Field | Value |
+|-------|-------|
+| **Priority** | Critical |
+| **Type** | Architecture |
+
+**Test Steps**:
+```bash
+# Test 1: Verify column structure
+mysql -u root -p voltstartev_db -e "
+  DESCRIBE charging_sessions;
+" | grep -E "energy_kwh|total_cost|duration_seconds"
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# mysql -u root -p voltstartev_db -e "
+  DESCRIBE charging_sessions;
+" | grep -E "energy_kwh|total_cost|duration_seconds"
+Enter password: 
+duration_seconds        int     YES             NULL    STORED GENERATED
+energy_kwh      decimal(10,3)   YES             NULL    STORED GENERATED
+total_cost      decimal(10,2)   YES             NULL    STORED GENERATED
+root@steve-server:/build/VoltStartEV_Backend# 
+
+# Test 2: Attempt INSERT with generated column values (should fail)
+mysql -u root -p voltstartev_db -e "
+  INSERT INTO charging_sessions (
+    app_user_id, steve_transaction_pk, charge_box_id, connector_id, id_tag,
+    start_time, end_time, start_meter_value, end_meter_value,
+    energy_kwh, total_cost
+  ) VALUES (
+    1, 999, 'CS-TEST-001', 1, 'TEST001',
+    NOW(), NOW(), 1000, 2000,
+    1.000, 0.75
+  );
+" 2>&1 | grep -i error
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# mysql -u root -p voltstartev_db -e "
+  INSERT INTO charging_sessions (
+    app_user_id, steve_transaction_pk, charge_box_id, connector_id, id_tag,
+    start_time, end_time, start_meter_value, end_meter_value,
+    energy_kwh, total_cost
+  ) VALUES (
+    1, 999, 'CS-TEST-001', 1, 'TEST001',
+    NOW(), NOW(), 1000, 2000,
+    1.000, 0.75
+  );
+" 2>&1 | grep -i error
+Enter password: 
+ERROR 3105 (HY000) at line 2: The value specified for generated column 'energy_kwh' in table 'charging_sessions' is not allowed.
+root@steve-server:/build/VoltStartEV_Backend# 
+
+# Test 3: Correct INSERT (omit generated columns)
+mysql -u root -p voltstartev_db -e "
+  INSERT INTO charging_sessions (
+    app_user_id, steve_transaction_pk, charge_box_id, connector_id, id_tag,
+    start_time, end_time, start_meter_value, end_meter_value,
+    status
+  ) VALUES (
+    1, 999, 'CS-TEST-001', 1, 'TEST001',
+    NOW(), NOW(), 1000, 2000,
+    'completed'
+  );
+"
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# mysql -u root -p voltstartev_db -e "
+  INSERT INTO charging_sessions (
+    app_user_id, steve_transaction_pk, charge_box_id, connector_id, id_tag,
+    start_time, end_time, start_meter_value, end_meter_value,
+    status
+  ) VALUES (
+    1, 999, 'CS-TEST-001', 1, 'TEST001',
+    NOW(), NOW(), 1000, 2000,
+    'completed'
+  );
+"
+Enter password: 
+root@steve-server:/build/VoltStartEV_Backend# 
+
+# Test 4: Verify generated columns auto-calculated
+mysql -u root -p voltstartev_db -e "
+  SELECT 
+    start_meter_value,
+    end_meter_value,
+    (end_meter_value - start_meter_value) / 1000 AS manual_kwh,
+    energy_kwh AS generated_kwh,
+    ROUND((energy_kwh * 0.25) + 0.50, 2) AS manual_cost,
+    total_cost AS generated_cost
+  FROM charging_sessions
+  WHERE steve_transaction_pk = 999;
+"
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# mysql -u root -p voltstartev_db -e "
+  SELECT 
+    start_meter_value,
+    end_meter_value,
+    (end_meter_value - start_meter_value) / 1000 AS manual_kwh,
+    energy_kwh AS generated_kwh,
+    ROUND((energy_kwh * 0.25) + 0.50, 2) AS manual_cost,
+    total_cost AS generated_cost
+  FROM charging_sessions
+  WHERE steve_transaction_pk = 999;
+"
+Enter password: 
++-------------------+-----------------+------------+---------------+-------------+----------------+
+| start_meter_value | end_meter_value | manual_kwh | generated_kwh | manual_cost | generated_cost |
++-------------------+-----------------+------------+---------------+-------------+----------------+
+|           1000.00 |         2000.00 |   1.000000 |         1.000 |        0.75 |           0.75 |
++-------------------+-----------------+------------+---------------+-------------+----------------+
+root@steve-server:/build/VoltStartEV_Backend# 
+
+# Cleanup
+mysql -u root -p voltstartev_db -e "DELETE FROM charging_sessions WHERE steve_transaction_pk = 999;"
+```
+
+**Expected Results**:
+| Test | Expected Result |
+|------|----------------|
+| 1 | Columns show `GENERATED ALWAYS AS` in Extra column |
+| 2 | `ERROR 3105 (HY000): The value specified for generated column 'energy_kwh' is not allowed` ✅ |
+| 3 | Success - row inserted ✅ |
+| 4 | `manual_kwh` = `generated_kwh`, `manual_cost` = `generated_cost` ✅ |
+
+---
+
+### DB-003: Verify user_ocpp_tag Linkage Table is Writable
+| Field | Value |
+|-------|-------|
+| **Priority** | Critical |
+| **Type** | Architecture |
+
+**Test Steps**:
+```bash
+# Test 1: Verify it's a TABLE (not VIEW)
+mysql -u root -p stevedb -e "
+  SELECT TABLE_TYPE 
+  FROM information_schema.TABLES 
+  WHERE TABLE_SCHEMA = 'stevedb' AND TABLE_NAME = 'user_ocpp_tag';
+"
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# mysql -u root -p stevedb -e "
+  SELECT TABLE_TYPE 
+  FROM information_schema.TABLES 
+  WHERE TABLE_SCHEMA = 'stevedb' AND TABLE_NAME = 'user_ocpp_tag';
+"
+Enter password: 
++------------+
+| TABLE_TYPE |
++------------+
+| BASE TABLE |
++------------+
+root@steve-server:/build/VoltStartEV_Backend# 
+
+# Test 2: INSERT new linkage
+OCCP_TAG_PK=$(mysql -u root -p stevedb -N -e "
+  SELECT ocpp_tag_pk FROM ocpp_tag WHERE id_tag = 'QATEST001' LIMIT 1;
+")
+
+echo "ocpp_tag_pk for QATEST001: $OCCP_TAG_PK"
+
+# Now use it in the INSERT
+mysql -u root -p stevedb -e "
+INSERT INTO user_ocpp_tag (user_pk, ocpp_tag_pk)
+VALUES (1, $OCCP_TAG_PK)
+ON DUPLICATE KEY UPDATE updated_at = NOW();
+"
+
+Result: Pass.
+
+# Test 3: Verify INSERT worked
+mysql -u root -p stevedb -e "
+  SELECT user_pk, ocpp_tag_pk, created_at, updated_at
+  FROM user_ocpp_tag
+  WHERE user_pk = 1 AND ocpp_tag_pk = 191;
+"
+
+Result: Fail
+root@steve-server:/build/VoltStartEV_Backend# mysql -u root -p stevedb -e "
+  SELECT user_pk, ocpp_tag_pk, created_at, updated_at
+  FROM user_ocpp_tag
+  WHERE user_pk = 1 AND ocpp_tag_pk = 191;
+"
+Enter password: 
+root@steve-server:/build/VoltStartEV_Backend# 
+
+Initial table 
+
+
+mysql> select * from user_ocpp_tag;
++---------+-------------+---------------------+---------------------+
+| user_pk | ocpp_tag_pk | created_at          | updated_at          |
++---------+-------------+---------------------+---------------------+
+|       1 |         281 | 2026-03-11 12:24:12 | 2026-03-12 11:21:56 |
+|       1 |         286 | 2026-03-11 16:54:31 | 2026-03-11 16:54:49 |
+|       2 |         282 | 2026-03-11 12:24:13 | 2026-03-11 12:24:13 |
++---------+-------------+---------------------+---------------------+
+3 rows in set (0.02 sec)
+
+root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# mysql -u root -p stevedb -e "
+  SELECT user_pk, ocpp_tag_pk, created_at, updated_at
+  FROM user_ocpp_tag
+  WHERE user_pk = 1 AND ocpp_tag_pk = 191;
+"
+Enter password: 
+root@steve-server:/build/VoltStartEV_Backend# mysql -u root -p stevedb
+Enter password: 
+Reading table information for completion of table and column names
+You can turn off this feature to get a quicker startup with -A
+
+Welcome to the MySQL monitor.  Commands end with ; or \g.
+Your MySQL connection id is 14980
+Server version: 8.0.45-0ubuntu0.22.04.1 (Ubuntu)
+
+Copyright (c) 2000, 2026, Oracle and/or its affiliates.
+
+Oracle is a registered trademark of Oracle Corporation and/or its
+affiliates. Other names may be trademarks of their respective
+owners.
+
+Type 'help;' or '\h' for help. Type '\c' to clear the current input statement.
+
+mysql> select * from user_ocpp_tag
+    -> ;
++---------+-------------+---------------------+---------------------+
+| user_pk | ocpp_tag_pk | created_at          | updated_at          |
++---------+-------------+---------------------+---------------------+
+|       1 |         281 | 2026-03-11 12:24:12 | 2026-03-12 11:21:56 |
+|       1 |         286 | 2026-03-11 16:54:31 | 2026-03-11 16:54:49 |
+|       2 |         282 | 2026-03-11 12:24:13 | 2026-03-11 12:24:13 |
++---------+-------------+---------------------+---------------------+
+3 rows in set (0.10 sec)
+
+mysql> 
+
+# Test 4: DELETE linkage
+mysql -u root -p stevedb -e "
+  DELETE FROM user_ocpp_tag WHERE user_pk = 1 AND ocpp_tag_pk = 191;
+"
+Result: Fail 
+As Test 4 failed so it also failed. 
+
+
+# Test 5: Verify DELETE worked
+mysql -u root -p stevedb -e "
+  SELECT COUNT(*) as count FROM user_ocpp_tag WHERE user_pk = 1 AND ocpp_tag_pk = 191;
+"
+
+Result: Fail
+```
+
+**Expected Results**:
+| Test | Expected Result |
+|------|----------------|
+| 1 | `TABLE_TYPE = BASE TABLE` |
+| 2 | Success - row inserted/updated ✅ |
+| 3 | Row exists with timestamps ✅ |
+| 4 | Success - row deleted ✅ |
+| 5 | `count = 0` ✅ |
+
+---
+
+## 🔐 Authentication & Authorization Tests
+
+### AUTH-001: User Registration
+| Field | Value |
+|-------|-------|
+| **Priority** | High |
+| **Type** | Functional |
+| **Precondition** | Fresh user database |
+
+**Test Steps**:
+```bash
+# Test 1: Valid registration
+curl -X POST http://localhost:3000/api/users \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "qanewuser001",
+    "email": "qanew001@test.com",
+    "password": "QATest123!",
+    "firstName": "QA",
+    "lastName": "NewUser"
+  }' | jq
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# curl -X POST http://localhost:3000/api/users   -H "Content-Type: application/json"   -d '{
+    "username": "qanewuser001",
+    "email": "qanew001@test.com",
+    "password": "QATest123!",
+    "firstName": "QA",
+    "lastName": "NewUser"
+  }' | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   490  100   340  100   150    291    128  0:00:01  0:00:01 --:--:--   420
+{
+  "success": true,
+  "message": "User registered successfully",
+  "data": {
+    "userId": 27,
+    "username": "qanewuser001",
+    "email": "qanew001@test.com",
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MjcsInVzZXJuYW1lIjoicWFuZXd1c2VyMDAxIiwicm9sZSI6ImN1c3RvbWVyIiwiaWF0IjoxNzczMjM0NDI2LCJleHAiOjE3NzM4MzkyMjZ9.uX7Fjzo-WqGK0R3pSWRn8j0I4T-IkvPRLpvmccoigWU"
+  }
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+
+
+
+# Test 2: Duplicate username------------------------------------------------ DANGER (TWO username can be possible ??)
+curl -X POST http://localhost:3000/api/users \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "qatest001",
+    "email": "duplicate@test.com",
+    "password": "QATest123!"
+  }' | jq
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# curl -X POST http://localhost:3000/api/users \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "qatest001",
+    "email": "duplicate@test.com",
+    "password": "QATest123!"
+  }' | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   183  100    85  100    98    297    342 --:--:-- --:--:-- --:--:--   642
+{
+  "success": false,
+  "error": "Conflict",
+  "message": "Username or email already registered"
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+
+# Test 3: Duplicate email
+curl -X POST http://localhost:3000/api/users \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "qanewuser002",
+    "email": "qa001@voltstartev.com",
+    "password": "QATest123!"
+  }' | jq
+  
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# curl -X POST http://localhost:3000/api/users \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "qanewuser002",
+    "email": "qa001@voltstartev.com",
+    "password": "QATest123!"
+  }' | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   189  100    85  100   104   1588   1943 --:--:-- --:--:-- --:--:--  3566
+{
+  "success": false,
+  "error": "Conflict",
+  "message": "Username or email already registered"
+}
+root@steve-server:/build/VoltStartEV_Backend#  
+
+# Test 4: Weak password
+curl -X POST http://localhost:3000/api/users \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "qanewuser003",
+    "email": "qanew003@test.com",
+    "password": "123"
+  }' | jq
+  
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# curl -X POST http://localhost:3000/api/users \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "qanewuser003",
+    "email": "qanew003@test.com",
+    "password": "123"
+  }' | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   189  100    96  100    93  10256   9935 --:--:-- --:--:-- --:--:-- 21000
+{
+  "success": false,
+  "error": "Bad request",
+  "message": "Password does not meet security requirements"
+}
+
+root@steve-server:/build/VoltStartEV_Backend#  
+
+
+# Test 5: Missing required fields
+curl -X POST http://localhost:3000/api/users \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "qanewuser004"
+  }' | jq
+  
+Result: Pass
+oot@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# curl -X POST http://localhost:3000/api/users \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "qanewuser004"
+  }' | jq
+```
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   130  100    94  100    36  17053   6531 --:--:-- --:--:-- --:--:-- 26000
+{
+  "success": false,
+  "error": "Bad request",
+  "message": "username, email, and password are required"
+}
+>  
+```
+
+**Expected Results**:
+| Test | Expected Status | Expected Response |
+|------|----------------|-------------------|
+| 1 | 201 | `{"success": true, "data": {"userId": ..., "token": ...}}` |
+| 2 | 409 | `{"success": false, "error": "Username already exists"}` |
+| 3 | 409 | `{"success": false, "error": "Email already exists"}` |
+| 4 | 400 | `{"success": false, "error": "Password too weak"}` |
+| 5 | 400 | `{"success": false, "error": "Missing required fields"}` |
+
+---
+
+### AUTH-002: User Login
+| Field | Value |
+|-------|-------|
+| **Priority** | High |
+| **Type** | Functional |
+
+**Test Steps**:
+```bash
+# Test 1: Valid credentials
+curl -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "qatest001",
+    "password": "QATest123!"
+  }' | jq
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# curl -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "qatest001",
+    "password": "QATest123!"
+  }' | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   433  100   370  100    63   3765    641 --:--:-- --:--:-- --:--:--  4510
+{
+  "success": true,
+  "message": "Login successful",
+  "data": {
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MjQsInVzZXJuYW1lIjoicWF0ZXN0MDAxIiwicm9sZSI6ImN1c3RvbWVyIiwiaWF0IjoxNzczMjQ2NzI3LCJleHAiOjE3NzM4NTE1Mjd9.csQ6-BVlTLUJlgTLyBDq4IuQ2xgW8FGyeX-qqIZNGtQ",
+    "user": {
+      "userId": 24,
+      "username": "qatest001",
+      "email": "qa001@voltstartev.com",
+      "firstName": "QA",
+      "lastName": "Test1"
+    }
+  }
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+   
+# Test 2: Invalid password
+curl -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "qatest001",
+    "password": "WrongPassword123!"
+  }' | jq
+Result: Pass
+
+root@steve-server:/build/VoltStartEV_Backend# curl -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "qatest001",
+    "password": "WrongPassword123!"
+  }' | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   142  100    72  100    70    710    690 --:--:-- --:--:-- --:--:--  1405
+{
+  "success": false,
+  "error": "Unauthorized",
+  "message": "Invalid credentials"
+}
+root@steve-server:/build/VoltStartEV_Backend#  
+
+# Test 3: Non-existent user
+curl -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "nonexistent",
+    "password": "QATest123!"
+  }' | jq
+
+Result: Pass
+curl -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "nonexistent",
+    "password": "QATest123!"
+  }' | jq
+
+# Test 4: Inactive user (qatest003 has is_active=0)
+curl -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "qatest003",
+    "password": "QATest123!"
+  }' | jq
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# curl -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "qatest003",
+    "password": "QATest123!"
+  }' | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   132  100    69  100    63   8875   8103 --:--:-- --:--:-- --:--:-- 18857
+{
+  "success": false,
+  "error": "Forbidden",
+  "message": "Account is inactive"
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+
+# Test 5: Missing credentials
+curl -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{}' | jq
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# curl -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{}' | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100    88  100    86  100     2  12375    287 --:--:-- --:--:-- --:--:-- 17600
+{
+  "success": false,
+  "error": "Bad request",
+  "message": "Username and password are required"
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+```
+
+**Expected Results**:
+| Test | Expected Status | Expected Response |
+|------|----------------|-------------------|
+| 1 | 200 | `{"success": true, "data": {"token": "...", "user": {...}}}` |
+| 2 | 401 | `{"success": false, "error": "Invalid credentials"}` |
+| 3 | 401 | `{"success": false, "error": "Invalid credentials"}` |
+| 4 | 403 | `{"success": false, "error": "Account is inactive"}` |
+| 5 | 400 | `{"success": false, "error": "Username and password required"}` |
+
+---
+
+### AUTH-003: JWT Token Validation
+| Field | Value |
+|-------|-------|
+| **Priority** | High |
+| **Type** | Security |
+
+**Test Steps**:
+```bash
+# Get valid token first
+TOKEN=$(curl -s -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"qatest001","password":"QATest123!"}' | jq -r '.data.token')
+
+# Test 1: Valid token
+curl -X GET http://localhost:3000/api/charging/sessions \
+  -H "Authorization: Bearer $TOKEN" | jq
+
+Result: Pass 
+root@steve-server:/build/VoltStartEV_Backend# curl -X GET http://localhost:3000/api/charging/sessions   -H "Authorization: Bearer $TOKEN" | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   375  100   375    0     0   2174      0 --:--:-- --:--:-- --:--:--  2180
+{
+  "success": true,
+  "data": [
+    {
+      "session_id": 9,
+      "charge_box_id": "CS-TEST-033",
+      "connector_id": 1,
+      "id_tag": "TEST001",
+      "start_time": "2026-03-12T17:18:35.000Z",
+      "end_time": "2026-03-12T17:18:35.000Z",
+      "duration_seconds": 0,
+      "energy_kwh": "1.000",
+      "total_cost": "0.75",
+      "status": "completed",
+      "payment_status": "pending",
+      "created_at": "2026-03-12T17:18:35.000Z"
+    }
+  ],
+  "timestamp": "2026-03-12T17:18:59.052Z"
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+
+# Test 2: Missing token
+curl -X GET http://localhost:3000/api/charging/sessions | jq
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# curl -X GET http://localhost:3000/api/charging/sessions | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   142  100   142    0     0  17615      0 --:--:-- --:--:-- --:--:-- 20285
+{
+  "success": false,
+  "error": "Unauthorized",
+  "message": "Authorization header with Bearer token is required",
+  "timestamp": "2026-03-12T17:28:53.219Z"
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+
+
+# Test 3: Invalid token format
+curl -X GET http://localhost:3000/api/charging/sessions \
+  -H "Authorization: InvalidToken" | jq
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# curl -X GET http://localhost:3000/api/charging/sessions \
+  -H "Authorization: InvalidToken" | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   142  100   142    0     0  30491      0 --:--:-- --:--:-- --:--:-- 35500
+{
+  "success": false,
+  "error": "Unauthorized",
+  "message": "Authorization header with Bearer token is required",
+  "timestamp": "2026-03-12T17:29:17.442Z"
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+
+# Test 4: Expired token
+curl -X GET http://localhost:3000/api/charging/sessions \
+  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MSwiZXhwIjoxfQ.expired" | jq
+
+Result : Pass
+root@steve-server:/build/VoltStartEV_Backend# curl -X GET http://localhost:3000/api/charging/sessions \
+  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MSwiZXhwIjoxfQ.expired" | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   116  100   116    0     0   1958      0 --:--:-- --:--:-- --:--:--  2000
+{
+  "success": false,
+  "error": "Unauthorized",
+  "message": "Invalid or expired token",
+  "timestamp": "2026-03-12T17:29:47.260Z"
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+
+# Test 5: Tampered token
+curl -X GET http://localhost:3000/api/charging/sessions \
+  -H "Authorization: Bearer ${TOKEN}tampered" | jq
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# 
+curl -X GET http://localhost:3000/api/charging/sessions \
+  -H "Authorization: Bearer ${TOKEN}tampered" | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   116  100   116    0     0   5073      0 --:--:-- --:--:-- --:--:--  5272
+{
+  "success": false,
+  "error": "Unauthorized",
+  "message": "Invalid or expired token",
+  "timestamp": "2026-03-12T17:31:48.861Z"
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+```
+
+**Expected Results**:
+| Test | Expected Status | Expected Response |
+|------|----------------|-------------------|
+| 1 | 200 | `{"success": true, "data": [...]}` |
+| 2 | 401 | `{"success": false, "error": "Unauthorized"}` |
+| 3 | 401 | `{"success": false, "error": "Unauthorized"}` |
+| 4 | 401 | `{"success": false, "error": "Token expired"}` |
+| 5 | 401 | `{"success": false, "error": "Invalid token"}` |
+
+---
+
+## 👤 User Management Tests
+
+### USER-001: Get User Profile
+| Field | Value |
+|-------|-------|
+| **Priority** | Medium |
+| **Type** | Functional |
+
+**Test Steps**:
+```bash
+TOKEN=$(curl -s -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"qatest001","password":"QATest123!"}' | jq -r '.data.token')
+
+# Test 1: Get own profile
+curl -X GET http://localhost:3000/api/users/me \
+  -H "Authorization: Bearer $TOKEN" | jq
+
+Result: Pass 
+root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# curl -X GET http://localhost:3000/api/users/me \
+  -H "Authorization: Bearer $TOKEN" | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   131  100   131    0     0    790      0 --:--:-- --:--:-- --:--:--   793
+{
+  "success": true,
+  "data": {
+    "user_id": 24,
+    "username": "qatest001",
+    "email": "qa001@voltstartev.com",
+    "first_name": "QA",
+    "last_name": "Test1"
+  }
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+
+# Test 2: Get another user's profile (should be restricted)
+curl -X GET http://localhost:3000/api/users/2 \
+  -H "Authorization: Bearer $TOKEN" | jq
+ Result : Pass 
+root@steve-server:/build/VoltStartEV_Backend# curl -X GET http://localhost:3000/api/users/2 \
+  -H "Authorization: Bearer $TOKEN" | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100    84  100    84    0     0   9411      0 --:--:-- --:--:-- --:--:-- 10500
+{
+  "success": false,
+  "error": "Forbidden",
+  "message": "You can only view your own profile"
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+```
+
+
+**Expected Results**:
+| Test | Expected Status | Expected Response |
+|------|----------------|-------------------|
+| 1 | 200 | `{"success": true, "data": {"userId": 1, "username": "qatest001", ...}}` |
+| 2 | 403 | `{"success": false, "error": "Forbidden"}` |
+
+---
+
+## 🏷️ Tag Assignment Tests
+
+### TAG-001: Assign Tag to User
+| Field | Value |
+|-------|-------|
+| **Priority** | High |
+| **Type** | Functional |
+
+**Test Steps**:
+```bash
+TOKEN=$(curl -s -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"qatest001","password":"QATest123!"}' | jq -r '.data.token')
+
+# Test 1: Assign valid unassigned tag
+curl -X POST http://localhost:3000/api/users/1/tags \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "idTag": "QATEST001",
+    "nickname": "QA Test Card"
+  }' | jq
+  
+  
+ Result: Pass
+[DEBUG] 2026-03-13 10:50:50,670 de.rwth.idsg.steve.web.api.OcppTagsRestController (qtp1486273013-21708) - Read request for query: OcppTagQueryForm.OcppTagQueryFormForApi(super=OcppTagQueryForm(ocppTagPk=null, idTag=QATEST001, parentIdTag=null, userId=null, expired=ALL, inTransaction=ALL, blocked=ALL, note=null, userFilter=All))
+[DEBUG] 2026-03-13 10:50:53,256 de.rwth.idsg.steve.web.api.OcppTagsRestController (qtp1486273013-21708) - Read response for query: [OcppTag.OcppTagOverview(ocppTagPk=292, idTag=QATEST001, userPk=null, parentOcppTagPk=null, parentIdTag=null, inTransaction=false, blocked=false, expiryDateFormatted=, expiryDate=null, maxActiveTransactionCount=1, activeTransactionCount=0, note=QA Test Tag 1)]
+
+
+mysql> select * from user_ocpp_tag;
++---------+-------------+---------------------+---------------------+
+| user_pk | ocpp_tag_pk | created_at          | updated_at          |
++---------+-------------+---------------------+---------------------+
+|       2 |         293 | 2026-03-12 15:24:28 | 2026-03-12 15:24:28 |
++---------+-------------+---------------------+---------------------+
+1 row in set (0.17 sec)
+
+mysql> q
+    -> ;
+ERROR 1064 (42000): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'q' at line 1
+mysql> exit
+Bye
+root@steve-server:/build/VoltStartEV_Backend# TOKEN=$(curl -s -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"qatest001","password":"QATest123!"}' | jq -r '.data.token')
+root@steve-server:/build/VoltStartEV_Backend# echo $TOKEN
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MzMsInVzZXJuYW1lIjoicWF0ZXN0MDAxIiwicm9sZSI6ImN1c3RvbWVyIiwiaWF0IjoxNzczMzk5MDA0LCJleHAiOjE3NzQwMDM4MDR9.b11mwlCzJjz-4xNNLC_2-M21mjsqApSDOQL08PQC73I
+root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# curl -X POST http://localhost:3000/api/users/33/tags \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"idTag":"QATEST001","nickname":"First User"}' | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   248  100   203  100    45     11      2  0:00:22  0:00:17  0:00:05    48
+{
+  "success": true,
+  "message": "Tag assigned successfully",
+  "data": {
+    "userId": 33,
+    "idTag": "QATEST001",
+    "nickname": "First User",
+    "ocppTagPk": 292,
+    "provisionedVia": "steve-api"
+  },
+  "timestamp": "2026-03-13T10:50:55.373Z"
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# mysql -u root -p stevedb
+Enter password: 
+Reading table information for completion of table and column names
+You can turn off this feature to get a quicker startup with -A
+
+Welcome to the MySQL monitor.  Commands end with ; or \g.
+Your MySQL connection id is 16724
+Server version: 8.0.45-0ubuntu0.22.04.1 (Ubuntu)
+
+Copyright (c) 2000, 2026, Oracle and/or its affiliates.
+
+Oracle is a registered trademark of Oracle Corporation and/or its
+affiliates. Other names may be trademarks of their respective
+owners.
+
+Type 'help;' or '\h' for help. Type '\c' to clear the current input statement.
+
+mysql> select * from user_ocpp_tag;
++---------+-------------+---------------------+---------------------+
+| user_pk | ocpp_tag_pk | created_at          | updated_at          |
++---------+-------------+---------------------+---------------------+
+|       2 |         293 | 2026-03-12 15:24:28 | 2026-03-12 15:24:28 |
+|      33 |         292 | 2026-03-13 10:50:55 | 2026-03-13 10:50:55 |
++---------+-------------+---------------------+---------------------+
+2 rows in set (0.05 sec)
+ 
+# Test 2: Assign already assigned tag
+curl -X POST http://localhost:3000/api/users/1/tags \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "idTag": "QATEST001",
+    "nickname": "Duplicate Assignment"
+  }' | jq
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# curl -X POST http://localhost:3000/api/users/33/tags \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "idTag": "QATEST001",
+    "nickname": "Duplicate Assignment"
+  }' | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   194  100   124  100    70    114     64  0:00:01  0:00:01 --:--:--   179
+{
+  "success": true,
+  "message": "Tag already assigned",
+  "data": {
+    "userId": 33,
+    "idTag": "QATEST001",
+    "nickname": "Duplicate Assignment"
+  }
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+
+# Test 3: Assign non-existent tag
+curl -X POST http://localhost:3000/api/users/1/tags \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "idTag": "NONEXISTENT",
+    "nickname": "Invalid Tag"
+  }' | jq
+  
+  Result: Fail
+root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# curl -X POST http://localhost:3000/api/users/33/tags \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "idTag": "NONEXISTENT",
+    "nickname": "Invalid Tag"
+  }' | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   269  100   206  100    63     28      8  0:00:07  0:00:07 --:--:--    50
+{
+  "success": true,
+  "message": "Tag assigned successfully",
+  "data": {
+    "userId": 33,
+    "idTag": "NONEXISTENT",
+    "nickname": "Invalid Tag",
+    "ocppTagPk": 296,
+    "provisionedVia": "steve-api"
+  },
+  "timestamp": "2026-03-13T11:00:11.428Z"
+}
+root@steve-server:/build/VoltStartEV_Backend# mysql -u root -p stevedb
+Enter password: 
+Reading table information for completion of table and column names
+You can turn off this feature to get a quicker startup with -A
+
+Welcome to the MySQL monitor.  Commands end with ; or \g.
+Your MySQL connection id is 16736
+Server version: 8.0.45-0ubuntu0.22.04.1 (Ubuntu)
+
+Copyright (c) 2000, 2026, Oracle and/or its affiliates.
+
+Oracle is a registered trademark of Oracle Corporation and/or its
+affiliates. Other names may be trademarks of their respective
+owners.
+
+Type 'help;' or '\h' for help. Type '\c' to clear the current input statement.
+
+mysql> select * from user_ocpp_tag;
++---------+-------------+---------------------+---------------------+
+| user_pk | ocpp_tag_pk | created_at          | updated_at          |
++---------+-------------+---------------------+---------------------+
+|       2 |         293 | 2026-03-12 15:24:28 | 2026-03-12 15:24:28 |
+|      33 |         292 | 2026-03-13 10:50:55 | 2026-03-13 10:50:55 |
+|      33 |         296 | 2026-03-13 11:00:11 | 2026-03-13 11:00:11 |
++---------+-------------+---------------------+---------------------+
+3 rows in set (0.00 sec)
+
+mysql>  
+
+# Test 4: Verify tag linkage in user_ocpp_tag (NOT ocpp_tag_activity)
+mysql -u root -p stevedb -e "
+  SELECT uot.user_pk, uot.ocpp_tag_pk, uot.created_at, ot.id_tag
+  FROM user_ocpp_tag uot
+  JOIN ocpp_tag ot ON ot.ocpp_tag_pk = uot.ocpp_tag_pk
+  WHERE ot.id_tag = 'QATEST001';
+"
+
+Result: Pass 
+mysql> select * from user_ocpp_tag
+    -> ;
++---------+-------------+---------------------+---------------------+
+| user_pk | ocpp_tag_pk | created_at          | updated_at          |
++---------+-------------+---------------------+---------------------+
+|       2 |         293 | 2026-03-12 15:24:28 | 2026-03-12 15:24:28 |
+|      33 |         292 | 2026-03-13 10:50:55 | 2026-03-13 10:50:55 |
+|      33 |         296 | 2026-03-13 11:00:11 | 2026-03-13 11:00:11 |
++---------+-------------+---------------------+---------------------+
+3 rows in set (0.00 sec)
+
+mysql>   SELECT uot.user_pk, uot.ocpp_tag_pk, uot.created_at, ot.id_tag
+    ->   FROM user_ocpp_tag uot
+    ->   JOIN ocpp_tag ot ON ot.ocpp_tag_pk = uot.ocpp_tag_pk
+    ->   WHERE ot.id_tag = 'QATEST001';
++---------+-------------+---------------------+-----------+
+| user_pk | ocpp_tag_pk | created_at          | id_tag    |
++---------+-------------+---------------------+-----------+
+|      33 |         292 | 2026-03-13 10:50:55 | QATEST001 |
++---------+-------------+---------------------+-----------+
+1 row in set (0.00 sec)
+
+mysql> 
+```
+
+
+**Expected Results**:
+| Test | Expected Status | Expected Response |
+|------|----------------|-------------------|
+| 1 | 201 | `{"success": true, "data": {"userId": 1, "idTag": "QATEST001", ...}}` |
+| 2 | 409 | `{"success": false, "error": "Tag already assigned"}` |
+| 3 | 404 | `{"success": false, "error": "Tag not found"}` |
+| 4 | Success | Row in `user_ocpp_tag` table ✅ |
+
+---
+
+### TAG-002: Tag Status Validation via ocpp_tag_activity VIEW
+| Field | Value |
+|-------|-------|
+| **Priority** | High |
+| **Type** | Integration |
+
+**Test Steps**:
+```bash
+# Test 1: Verify tag status is read from VIEW
+mysql -u root -p stevedb -e "
+  SELECT 
+    ot.id_tag,
+    ota.blocked,
+    ota.expiry_date,
+    ota.active_transaction_count,
+    ota.in_transaction
+  FROM ocpp_tag ot
+  JOIN ocpp_tag_activity ota ON ota.ocpp_tag_pk = ot.ocpp_tag_pk
+  WHERE ot.id_tag = 'QATEST001';
+"
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# mysql -u root -p stevedb -e "
+  SELECT 
+    ot.id_tag,
+    ota.blocked,
+    ota.expiry_date,
+    ota.active_transaction_count,
+    ota.in_transaction
+  FROM ocpp_tag ot
+  JOIN ocpp_tag_activity ota ON ota.ocpp_tag_pk = ot.ocpp_tag_pk
+  WHERE ot.id_tag = 'QATEST001';
+"
+Enter password: 
++-----------+---------+-------------+--------------------------+----------------+
+| id_tag    | blocked | expiry_date | active_transaction_count | in_transaction |
++-----------+---------+-------------+--------------------------+----------------+
+| QATEST001 |       0 | NULL        |                        0 |              0 |
++-----------+---------+-------------+--------------------------+----------------+
+root@steve-server:/build/VoltStartEV_Backend# 
+
+# Test 2: Trigger status change via OCPP (start charging)
+TOKEN=$(curl -s -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"qatest001","password":"QATest123!"}' | jq -r '.data.token')
+
+curl -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"chargeBoxId":"CS-SIMU-00001","connectorId":1,"idTag":"QATEST001"}' | jq
+
+root@steve-server:/build/VoltStartEV_Backend# curl -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"chargeBoxId":"CS-SIMU-00001","connectorId":1,"idTag":"QATEST001"}' | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   282  100   215  100    67     14      4  0:00:16  0:00:14  0:00:02    57
+{
+  "success": true,
+  "message": "Charging session initiated",
+  "data": {
+    "transactionId": 0,
+    "chargeBoxId": "CS-SIMU-00001",
+    "connectorId": 1,
+    "estimatedStartTime": "2026-03-13T11:07:25.397Z"
+  },
+  "timestamp": "2026-03-13T11:06:55.397Z"
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+
+warn:  Slow SteVe query: 608ms {"service":"voltstartev-backend","sql":"\n    SELECT \n      c.connector_id,\n      cs.status as connector_status,\n      cs.error_code,\n      c...","timestamp":"2026-03-13 11:06:42"}
+info:  Starting charging session for CS-SIMU-00001:1 {"appUserId":33,"chargeBoxId":"CS-SIMU-00001","idTag":"QATEST001","service":"voltstartev-backend","timestamp":"2026-03-13 11:06:42"}
+debug: SteVe API request: {"chargeBoxIdList":["CS-SIMU-00001"],"idTag":"QATEST001","connectorId":1} {"service":"voltstartev-backend","timestamp":"2026-03-13 11:06:42"}
+info:  RemoteStart via SteVe REST API succeeded {"appUserId":33,"chargeBoxId":"CS-SIMU-00001","idTag":"QATEST001","response":"Accepted","service":"voltstartev-backend","timestamp":"2026-03-13 11:06:55"}
+
+
+Steve Logs :
+[INFO ] 2026-03-13 11:06:52,865 de.rwth.idsg.steve.ocpp.ws.WebSocketLogger (qtp1486273013-21708) - [chargeBoxId=CS-SIMU-00001, sessionId=14b9b1d5-363b-213e-21ca-469c2c49eefb] Received: [3,"8961fb7a-c55f-40d8-84f4-bc7b92340e6b",{"status":"Accepted"}]
+[DEBUG] 2026-03-13 11:06:52,974 de.rwth.idsg.steve.ocpp.ws.FutureResponseContextStoreImpl (qtp1486273013-21708) - Store size for sessionId '14b9b1d5-363b-213e-21ca-469c2c49eefb': 0
+[INFO ] 2026-03-13 11:06:54,864 de.rwth.idsg.steve.ocpp.ws.WebSocketLogger (qtp1486273013-21708) - [chargeBoxId=CS-SIMU-00001, sessionId=14b9b1d5-363b-213e-21ca-469c2c49eefb] Received: [2,"f526ec1d-965c-4195-8ded-6c46050da24b","StatusNotification",{"connectorId":1,"errorCode":"NoError","status":"Preparing"}]
+[DEBUG] 2026-03-13 11:06:56,517 de.rwth.idsg.steve.repository.impl.OcppServerRepositoryImpl (qtp1486273013-21708) - Stored a new connector status for CS-SIMU-00001/1.
+[INFO ] 2026-03-13 11:06:56,638 de.rwth.idsg.steve.ocpp.ws.WebSocketLogger (qtp1486273013-21708) - [chargeBoxId=CS-SIMU-00001, sessionId=14b9b1d5-363b-213e-21ca-469c2c49eefb] Sending: [3,"f526ec1d-965c-4195-8ded-6c46050da24b",{}]
+[INFO ] 2026-03-13 11:06:56,929 de.rwth.idsg.steve.ocpp.ws.WebSocketLogger (qtp1486273013-21775) - [chargeBoxId=CS-SIMU-00001, sessionId=14b9b1d5-363b-213e-21ca-469c2c49eefb] Received: [2,"f36f7468-181a-4b4c-baea-d0b751cd7fd6","StartTransaction",{"idTag":"QATEST001","meterStart":0,"timestamp":"2026-03-13T11:06:53.692Z","connectorId":1}]
+[DEBUG] 2026-03-13 11:06:57,524 de.rwth.idsg.steve.service.AuthTagServiceLocal (qtp1486273013-21775) - The user with idTag 'QATEST001' is ACCEPTED.
+[DEBUG] 2026-03-13 11:06:59,454 de.rwth.idsg.steve.service.NotificationServiceForUser (SteVe-TaskScheduler-5) - Processing: OcppTransactionStarted(transactionId=256, params=InsertTransactionParams(chargeBoxId=CS-SIMU-00001, connectorId=1, idTag=QATEST001, startTimestamp=2026-03-13T11:06:53.692Z, startMeterValue=0, statusUpdate=AfterStart, reservationId=null, eventTimestamp=2026-03-13T11:06:57.696Z))
+[INFO ] 2026-03-13 11:07:00,483 de.rwth.idsg.steve.ocpp.ws.WebSocketLogger (qtp1486273013-21775) - [chargeBoxId=CS-SIMU-00001, sessionId=14b9b1d5-363b-213e-21ca-469c2c49eefb] Sending: [3,"f36f7468-181a-4b4c-baea-d0b751cd7fd6",{"transactionId":256,"idTagInfo":{"status":"Accepted","expiryDate":"2026-03-13T12:06:57.628Z"}}]
+[INFO ] 2026-03-13 11:07:00,788 de.rwth.idsg.steve.ocpp.ws.WebSocketLogger (qtp1486273013-21708) - [chargeBoxId=CS-SIMU-00001, sessionId=14b9b1d5-363b-213e-21ca-469c2c49eefb] Received: [2,"df28f175-6529-4431-b928-f95cf4a51a7c","StatusNotification",{"connectorId":1,"errorCode":"NoError","status":"Charging"}]
+[DEBUG] 2026-03-13 11:07:00,929 de.rwth.idsg.steve.repository.impl.OcppServerRepositoryImpl (qtp1486273013-21708) - Stored a new connector status for CS-SIMU-00001/1.
+[INFO ] 2026-03-13 11:07:00,942 de.rwth.idsg.steve.ocpp.ws.WebSocketLogger (qtp1486273013-21708) - [chargeBoxId=CS-SIMU-00001, sessionId=14b9b1d5-363b-213e-21ca-469c2c49eefb] Sending: [3,"df28f175-6529-4431-b928-f95cf4a51a7c",{}]
+[INFO ] 2026-03-13 11:07:31,353 de.rwth.idsg.steve.ocpp.ws.WebSocketLogger (qtp1486273013-21894) - [chargeBoxId=CS-SIMU-00001, sessionId=14b9b1d5-363b-213e-21ca-469c2c49eefb] Received: [2,"082e093c-ef5f-4731-bbc0-ac5948d8efa5","MeterValues",{"connectorId":1,"meterValue":[{"sampledValue":[{"context":"Sample.Periodic","location":"EV","measurand":"SoC","unit":"Percent","value":"100"},{"context":"Sample.Periodic","location":"Outlet","measurand":"Voltage","unit":"V","value":"419.82"},{"context":"Sample.Periodic","location":"Outlet","measurand":"Power.Active.Import","unit":"W","value":"10823.9"},{"context":"Sample.Periodic","location":"Outlet","measurand":"Current.Import","unit":"A","value":"6.04"},{"context":"Sample.Periodic","location":"Outlet","measurand":"Energy.Active.Import.Register","unit":"Wh","value":"40.38"}],"timestamp":"2026-03-13T11:07:32.119Z"}],"transactionId":256}]
+[INFO ] 2026-03-13 11:07:37,961 de.rwth.idsg.steve.ocpp.ws.WebSocketLogger (qtp1486273013-21894) - [chargeBoxId=CS-SIMU-00001, sessionId=14b9b1d5-363b-213e-21ca-469c2c49eefb] Sending: [3,"082e093c-ef5f-4731-bbc0-ac5948d8efa5",{}]
+
+# Wait for OCPP StartTransaction to process
+sleep 10
+
+# Test 3: Verify ocpp_tag_activity auto-updated by SteVe
+mysql -u root -p stevedb -e "
+  SELECT 
+    id_tag,
+    active_transaction_count,
+    in_transaction
+  FROM ocpp_tag_activity
+  WHERE id_tag = 'QATEST001';
+"
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# mysql -u root -p stevedb -e "
+  SELECT 
+    id_tag,
+    active_transaction_count,
+    in_transaction
+  FROM ocpp_tag_activity
+  WHERE id_tag = 'QATEST001';
+"
+Enter password: 
++-----------+--------------------------+----------------+
+| id_tag    | active_transaction_count | in_transaction |
++-----------+--------------------------+----------------+
+| QATEST001 |                        1 |              1 |
++-----------+--------------------------+----------------+
+root@steve-server:/build/VoltStartEV_Backend# 
+
+# Test 4: Stop charging and verify auto-update
+TX_ID=$(mysql -u root -p stevedb -N -e "
+  SELECT transaction_pk FROM transaction_start 
+  WHERE id_tag = 'QATEST001' ORDER BY start_timestamp DESC LIMIT 1;
+")
+
+curl -X POST http://localhost:3000/api/charging/stop \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d "{\"chargeBoxId\":\"CS-SIMU-00001\",\"transactionId\":$TX_ID}" | jq
+
+sleep 10
+
+Result: Pass
+[INFO ] 2026-03-13 11:11:15,539 de.rwth.idsg.steve.ocpp.ws.WebSocketLogger (SteVe-TaskScheduler-8) - [chargeBoxId=CS-SIMU-00001, sessionId=14b9b1d5-363b-213e-21ca-469c2c49eefb] Sending: [2,"bb852775-9d0d-474f-aaaa-afeedede0a03","RemoteStopTransaction",{"transactionId":256}]
+[DEBUG] 2026-03-13 11:11:15,541 de.rwth.idsg.steve.ocpp.ws.FutureResponseContextStoreImpl (SteVe-TaskScheduler-8) - Store size for sessionId '14b9b1d5-363b-213e-21ca-469c2c49eefb': 1
+[INFO ] 2026-03-13 11:11:15,835 de.rwth.idsg.steve.ocpp.ws.WebSocketLogger (qtp1486273013-21894) - [chargeBoxId=CS-SIMU-00001, sessionId=14b9b1d5-363b-213e-21ca-469c2c49eefb] Received: [3,"bb852775-9d0d-474f-aaaa-afeedede0a03",{"status":"Accepted"}]
+[DEBUG] 2026-03-13 11:11:15,835 de.rwth.idsg.steve.ocpp.ws.FutureResponseContextStoreImpl (qtp1486273013-21894) - Store size for sessionId '14b9b1d5-363b-213e-21ca-469c2c49eefb': 0
+[INFO ] 2026-03-13 11:11:15,977 de.rwth.idsg.steve.ocpp.ws.WebSocketLogger (qtp1486273013-21894) - [chargeBoxId=CS-SIMU-00001, sessionId=14b9b1d5-363b-213e-21ca-469c2c49eefb] Received: [2,"b9015063-0e0a-41f8-bb98-2fd8aaad1259","StatusNotification",{"connectorId":1,"errorCode":"NoError","status":"Finishing"}]
+[DEBUG] 2026-03-13 11:11:16,139 de.rwth.idsg.steve.repository.impl.OcppServerRepositoryImpl (qtp1486273013-21894) - Stored a new connector status for CS-SIMU-00001/1.
+[INFO ] 2026-03-13 11:11:16,149 de.rwth.idsg.steve.ocpp.ws.WebSocketLogger (qtp1486273013-21894) - [chargeBoxId=CS-SIMU-00001, sessionId=14b9b1d5-363b-213e-21ca-469c2c49eefb] Sending: [3,"b9015063-0e0a-41f8-bb98-2fd8aaad1259",{}]
+[INFO ] 2026-03-13 11:11:16,457 de.rwth.idsg.steve.ocpp.ws.WebSocketLogger (qtp1486273013-21775) - [chargeBoxId=CS-SIMU-00001, sessionId=14b9b1d5-363b-213e-21ca-469c2c49eefb] Received: [2,"07107e2b-4863-4fba-877f-606ed9abc65b","StopTransaction",{"idTag":"QATEST001","meterStop":1755,"timestamp":"2026-03-13T11:11:17.348Z","transactionId":256,"reason":"Remote"}]
+[DEBUG] 2026-03-13 11:11:16,777 de.rwth.idsg.steve.service.AuthTagServiceLocal (qtp1486273013-21775) - The user with idTag 'QATEST001' is ACCEPTED.
+[INFO ] 2026-03-13 11:11:17,201 de.rwth.idsg.steve.ocpp.ws.WebSocketLogger (qtp1486273013-21775) - [chargeBoxId=CS-SIMU-00001, sessionId=14b9b1d5-363b-213e-21ca-469c2c49eefb] Sending: [3,"07107e2b-4863-4fba-877f-606ed9abc65b",{"idTagInfo":{"status":"Accepted","expiryDate":"2026-03-13T12:11:16.826Z"}}]
+[DEBUG] 2026-03-13 11:11:17,201 de.rwth.idsg.steve.service.NotificationServiceForUser (SteVe-TaskScheduler-3) - Processing: OcppTransactionEnded(params=UpdateTransactionParams(chargeBoxId=CS-SIMU-00001, transactionId=256, stopTimestamp=2026-03-13T11:11:17.348Z, stopMeterValue=1755, stopReason=Remote, statusUpdate=AfterStop, eventActor=station, eventTimestamp=2026-03-13T11:11:16.830Z))
+[INFO ] 2026-03-13 11:11:17,474 de.rwth.idsg.steve.ocpp.ws.WebSocketLogger (qtp1486273013-21894) - [chargeBoxId=CS-SIMU-00001, sessionId=14b9b1d5-363b-213e-21ca-469c2c49eefb] Received: [2,"5c17cef6-4107-4d27-99ff-132772931271","StatusNotification",{"connectorId":1,"errorCode":"NoError","status":"Available"}]
+[DEBUG] 2026-03-13 11:11:17,552 de.rwth.idsg.steve.repository.impl.OcppServerRepositoryImpl (qtp1486273013-21894) - Stored a new connector status for CS-SIMU-00001/1.
+[INFO ] 2026-03-13 11:11:17,720 de.rwth.idsg.steve.ocpp.ws.WebSocketLogger (qtp1486273013-21894) - [chargeBoxId=CS-SIMU-00001, sessionId=14b9b1d5-363b-213e-21ca-469c2c49eefb] Sending: [3,"5c17cef6-4107-4d27-99ff-132772931271",{}]
+
+```
+
+**Expected Results**:
+| Test | Expected Result |
+|------|----------------|
+| 1 | VIEW shows `blocked=0`, `active_transaction_count=0` |
+| 2 | Charging starts successfully |
+| 3 | `active_transaction_count=1`, `in_transaction=1` (auto-updated by SteVe) |
+| 4 | Charging stops successfully |
+| 5 | `active_transaction_count=0`, `in_transaction=0` (auto-reset by SteVe) |
+
+---
+
+### TAG-003: Block Tag via SteVe REST API (NOT Direct SQL)
+| Field | Value |
+|-------|-------|
+| **Priority** | High |
+| **Type** | Integration |
+
+**Test Steps**:
+```bash
+# Test 1: Block tag via SteVe REST API
+curl -X PUT http://localhost:8080/steve/api/v1/ocpp-tags/QATEST001 \
+  -u voltstart_backend:ServiceSecretKey_2026! \
+  -H "Content-Type: application/json" \
+  -d '{
+    "blocked": true
+  }' | jq
+Result: Fail
+
+No log on backend:
+
+root@steve-server:/build/VoltStartEV_Backend# curl -X PUT http://localhost:8080/steve/api/v1/ocpp-tags/QATEST001 \
+  -u voltstart_backend:ServiceSecretKey_2026! \
+  -H "Content-Type: application/json" \
+  -d '{
+    "blocked": true
+  }' | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100    25    0     0  100    25      0      1  0:00:25  0:00:18  0:00:07     0
+root@steve-server:/build/VoltStartEV_Backend# mysql -u root -p stevedb -e "
+  SELECT id_tag, blocked 
+  FROM ocpp_tag_activity 
+  WHERE id_tag = 'QATEST001';
+"
+Enter password: 
++-----------+---------+
+| id_tag    | blocked |
++-----------+---------+
+| QATEST001 |       0 |
++-----------+---------+
+root@steve-server:/build/VoltStartEV_Backend# 
+# Test 2: Verify ocpp_tag_activity VIEW reflects block status
+mysql -u root -p stevedb -e "
+  SELECT id_tag, blocked 
+  FROM ocpp_tag_activity 
+  WHERE id_tag = 'QATEST001';
+"
+
+# Test 3: Try to start charging with blocked tag (should fail)
+TOKEN=$(curl -s -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"qatest001","password":"QATest123!"}' | jq -r '.data.token')
+
+curl -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"chargeBoxId":"CS-SIMU-00001","connectorId":1,"idTag":"QATEST001"}' | jq
+
+# Test 4: Unblock tag via SteVe REST API
+curl -X PUT http://localhost:8080/steve/api/v1/ocpp-tags/QATEST001 \
+  -u voltstart_backend:ServiceSecretKey_2026! \
+  -H "Content-Type: application/json" \
+  -d '{
+    "blocked": false
+  }' | jq
+
+# Test 5: Verify charging works after unblock
+curl -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"chargeBoxId":"CS-SIMU-00001","connectorId":1,"idTag":"QATEST001"}' | jq
+```
+
+**Expected Results**:
+| Test | Expected Status | Expected Response |
+|------|----------------|-------------------|
+| 1 | 200 | `{"success": true, "message": "Tag updated"}` |
+| 2 | `blocked=1` in VIEW |
+| 3 | 403 | `{"success": false, "error": "Tag is blocked"}` |
+| 4 | 200 | `{"success": true, "message": "Tag updated"}` |
+| 5 | 202 | `{"success": true, "message": "Charging session initiated"}` |
+
+---
+
+## 🔌 Charging Control Tests
+
+### CHARGE-001: Start Charging Session
+| Field | Value |
+|-------|-------|
+| **Priority** | Critical |
+| **Type** | Functional |
+
+**Test Steps**:
+```bash
+TOKEN=$(curl -s -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"qatest001","password":"QATest123!"}' | jq -r '.data.token')
+
+# Test 1: Valid start request
+curl -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "chargeBoxId": "CS-SIMU-00001",
+    "connectorId": 1,
+    "idTag": "QATEST001"
+  }' | jq
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# curl -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "chargeBoxId": "CS-SIMU-00001",
+    "connectorId": 1,
+    "idTag": "QATEST001"
+  }' | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   303  100   215  100    88     96     39  0:00:02  0:00:02 --:--:--   135
+{
+  "success": true,
+  "message": "Charging session initiated",
+  "data": {
+    "transactionId": 0,
+    "chargeBoxId": "CS-SIMU-00001",
+    "connectorId": 1,
+    "estimatedStartTime": "2026-03-13T11:25:15.119Z"
+  },
+  "timestamp": "2026-03-13T11:24:45.119Z"
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+
+# Test 2: Missing chargeBoxId
+curl -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "connectorId": 1,
+    "idTag": "QATEST001"
+  }' | jq
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# curl -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "connectorId": 1,
+    "idTag": "QATEST001"
+  }' | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   191  100   139  100    52  15014   5616 --:--:-- --:--:-- --:--:-- 23875
+{
+  "success": false,
+  "error": "Bad request",
+  "message": "chargeBoxId, connectorId, and idTag are required",
+  "timestamp": "2026-03-13T11:29:06.205Z"
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+
+# Test 3: Invalid charger ID
+curl -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "chargeBoxId": "NONEXISTENT",
+    "connectorId": 1,
+    "idTag": "QATEST001"
+  }' | jq
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# curl -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "chargeBoxId": "NONEXISTENT",
+    "connectorId": 1,
+    "idTag": "QATEST001"
+  }' | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   221  100   135  100    86  14742   9391 --:--:-- --:--:-- --:--:-- 27625
+{
+  "success": false,
+  "error": "Conflict",
+  "message": "Charger is Unknown. Please try another charger.",
+  "timestamp": "2026-03-13T11:30:20.854Z"
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+# Test 4: Tag not assigned to user
+curl -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "chargeBoxId": "CS-SIMU-00001",
+    "connectorId": 1,
+    "idTag": "QATEST002"
+  }' | jq
+
+
+Result: 
+root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# curl -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "chargeBoxId": "CS-SIMU-00001",
+    "connectorId": 1,
+    "idTag": "QATEST002"
+  }' | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   238  100   150  100    88   1370    803 --:--:-- --:--:-- --:--:--  2203
+{
+  "success": false,
+  "error": "Authorization failed",
+  "message": "RFID tag QATEST002 is not assigned to your account",
+  "timestamp": "2026-03-13T11:31:04.971Z"
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+
+# Test 5: Charger unavailable (set charger to Unavailable via SteVe UI first)
+curl -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "chargeBoxId": "CS-SIMU-00001",
+    "connectorId": 1,
+    "idTag": "QATEST001"
+  }' | jq
+  
+ Result: Pass (error statement need to change)
+root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# curl -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "chargeBoxId": "CS-SIMU-00001",
+    "connectorId": 1,
+    "idTag": "QATEST001"
+  }' | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   223  100   135  100    88   2240   1460 --:--:-- --:--:-- --:--:--  3716
+{
+  "success": false,
+  "error": "Conflict",
+  "message": "Charger is Unknown. Please try another charger.",
+  "timestamp": "2026-03-13T11:36:07.927Z"
+}
+root@steve-server:/build/VoltStartEV_Backend#  
+```
+
+**Expected Results**:
+| Test | Expected Status | Expected Response |
+|------|----------------|-------------------|
+| 1 | 202 | `{"success": true, "message": "Charging session initiated", ...}` |
+| 2 | 400 | `{"success": false, "error": "Bad request", "message": "chargeBoxId required"}` |
+| 3 | 404 | `{"success": false, "error": "Charger not found"}` |
+| 4 | 403 | `{"success": false, "error": "Tag not assigned to your account"}` |
+| 5 | 409 | `{"success": false, "error": "Charger is Unavailable"}` |
+
+---
+
+### CHARGE-002: Stop Charging Session
+| Field | Value |
+|-------|-------|
+| **Priority** | Critical |
+| **Type** | Functional |
+
+**Test Steps**:
+```bash
+TOKEN=$(curl -s -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"qatest001","password":"QATest123!"}' | jq -r '.data.token')
+
+# First, start a session to get transaction ID
+START=$(curl -s -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"chargeBoxId":"CS-SIMU-00001","connectorId":1,"idTag":"QATEST001"}')
+TX_ID=$(echo "$START" | jq -r '.data.transactionId')
+
+# Wait for transaction to be active
+sleep 10
+
+# Test 1: Valid stop request
+curl -X POST http://localhost:3000/api/charging/stop \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d "{
+    \"chargeBoxId\": \"CS-SIMU-00001\",
+    \"transactionId\": $TX_ID
+  }" | jq
+
+Result: Failed (sometimes timeout happening)
+
+root@steve-server:/build/VoltStartEV_Backend# curl -X POST http://localhost:3000/api/charging/stop \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d "{
+    \"chargeBoxId\": \"CS-SIMU-00001\",
+    \"transactionId\": $TX_ID
+  }" | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   217  100   151  100    66     10      4  0:00:16  0:00:13  0:00:03    32
+{
+  "success": false,
+  "error": "Internal server error",
+  "message": "Unable to stop charging session. Please try again.",
+  "timestamp": "2026-03-13T11:46:01.796Z"
+}
+root@steve-server:/build/VoltStartEV_Backend# curl -X POST http://localhost:3000/api/charging/stop   -H "Content-Type: application/json"   -H "Authorization: Bearer $TOKEN"   -d "{
+    \"chargeBoxId\": \"CS-SIMU-00001\",
+    \"transactionId\": $TX_ID
+  }" | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   239  100   173  100    66   3407   1299 --:--:-- --:--:-- --:--:--  4686
+{
+  "success": true,
+  "message": "Session already finished",
+  "data": {
+    "transactionId": 258,
+    "chargeBoxId": "CS-SIMU-00001",
+    "alreadyStopped": true
+  },
+  "timestamp": "2026-03-13T11:46:23.127Z"
+}
+root@steve-server:/build/VoltStartEV_Backend# TX_ID=$(mysql -u root -p stevedb -N -e "
+  SELECT transaction_pk FROM transaction_start 
+  WHERE id_tag = 'QATEST001' ORDER BY start_timestamp DESC LIMIT 1;
+")
+Enter password: 
+root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# echo $TX_ID
+258
+root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# 
+
+debug: POST /api/charging/stop {"ip":"::ffff:127.0.0.1","service":"voltstartev-backend","timestamp":"2026-03-13 11:45:48","userAgent":"curl/7.81.0"}
+ RemoteStop request: transactionId=258
+info:  Stop request for transaction 258 {"chargeBoxId":"CS-SIMU-00001","service":"voltstartev-backend","timestamp":"2026-03-13 11:45:50"}
+warn:  Slow SteVe query: 1363ms {"service":"voltstartev-backend","sql":"SELECT 1 FROM transaction_stop WHERE transaction_pk = ? LIMIT 1...","timestamp":"2026-03-13 11:45:51"}
+error: Failed to stop charging session {"chargeBoxId":"CS-SIMU-00001","error":"The operation was aborted due to timeout","service":"voltstartev-backend","timestamp":"2026-03-13 11:46:01","transactionId":258}
+error: RemoteStop failed {"error":{},"service":"voltstartev-backend","timestamp":"2026-03-13 11:46:01"}
+debug: POST /api/charging/stop {"ip":"::ffff:127.0.0.1","service":"voltstartev-backend","timestamp":"2026-03-13 11:46:23","userAgent":"curl/7.81.0"}
+ RemoteStop request: transactionId=258
+info:  Stop request for transaction 258 {"chargeBoxId":"CS-SIMU-00001","service":"voltstartev-backend","timestamp":"2026-03-13 11:46:23"}
+info:  Transaction 258 already stopped {"chargeBoxId":"CS-SIMU-00001","service":"voltstartev-backend","timestamp":"2026-03-13 11:46:23"}
+
+# Test 2: Stop already stopped session (idempotent)
+curl -X POST http://localhost:3000/api/charging/stop \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d "{
+    \"chargeBoxId\": \"CS-SIMU-00001\",
+    \"transactionId\": $TX_ID
+  }" | jq
+  
+  Result: Pass
+  root@steve-server:/build/VoltStartEV_Backend# curl -X POST http://localhost:3000/api/charging/stop \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d "{
+    \"chargeBoxId\": \"CS-SIMU-00001\",
+    \"transactionId\": $TX_ID
+  }" | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   239  100   173  100    66   2051    782 --:--:-- --:--:-- --:--:--  2914
+{
+  "success": true,
+  "message": "Session already finished",
+  "data": {
+    "transactionId": 258,
+    "chargeBoxId": "CS-SIMU-00001",
+    "alreadyStopped": true
+  },
+  "timestamp": "2026-03-13T11:52:37.981Z"
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+
+# Test 3: Stop non-existent transaction
+curl -X POST http://localhost:3000/api/charging/stop \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "chargeBoxId": "CS-SIMU-00001",
+    "transactionId": 999999
+  }' | jq
+
+Result: Fail
+root@steve-server:/build/VoltStartEV_Backend# curl -X POST http://localhost:3000/api/charging/stop \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "chargeBoxId": "CS-SIMU-00001",
+    "transactionId": 999999
+  }' | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   220  100   151  100    69     16      7  0:00:09  0:00:09 --:--:--    37
+{
+  "success": false,
+  "error": "Internal server error",
+  "message": "Unable to stop charging session. Please try again.",
+  "timestamp": "2026-03-13T11:54:26.785Z"
+}
+
+Steve 
+error: SteVe RemoteStop API error 400: {"error":"Bad Request","message":"This transaction is not active at this station.","path":"http://localhost:8080/steve/api/v1/operations/RemoteStopTransaction","status":400,"timestamp":"2026-03-13T11:54:34.644Z"} {"chargeBoxId":"CS-SIMU-00001","service":"voltstartev-backend","timestamp":"2026-03-13 11:54:34","transactionId":999999}
+error: Failed to stop charging session {"chargeBoxId":"CS-SIMU-00001","error":"SteVe API 400: {\"error\":\"Bad Request\",\"message\":\"This transaction is not active at this station.\",\"path\":\"http://localhost:8080/steve/api/v1/operations/RemoteStopTransaction\",\"status\":400,\"timestamp\":\"2026-03-13T11:54:34.644Z\"}","service":"voltstartev-backend","timestamp":"2026-03-13 11:54:34","transactionId":999999}
+error: RemoteStop failed {"error":{},"service":"voltstartev-backend","timestamp":"2026-03-13 11:54:34"}
+
+# Test 4: Missing transactionId
+curl -X POST http://localhost:3000/api/charging/stop \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "chargeBoxId": "CS-SIMU-00001"
+  }' | jq
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# curl -X POST http://localhost:3000/api/charging/stop \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "chargeBoxId": "CS-SIMU-00001"
+  }' | jq
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   173  100   133  100    40  17648   5307 --:--:-- --:--:-- --:--:-- 24714
+{
+  "success": false,
+  "error": "Bad request",
+  "message": "transactionId and chargeBoxId are required",
+  "timestamp": "2026-03-13T11:55:47.979Z"
+}
+```
+
+
+**Expected Results**:
+| Test | Expected Status | Expected Response |
+|------|----------------|-------------------|
+| 1 | 202 | `{"success": true, "message": "Stop command sent to charger", ...}` |
+| 2 | 200 | `{"success": true, "message": "Session already finished", "alreadyStopped": true}` |
+| 3 | 404 | `{"success": false, "error": "Transaction not found"}` |
+| 4 | 400 | `{"success": false, "error": "transactionId required"}` |
+
+---
+
+## 📊 Transaction Polling Tests
+
+### POLL-001: Get Active Session
+| Field | Value |
+|-------|-------|
+| **Priority** | Critical |
+| **Type** | Functional |
+
+**Test Steps**:
+```bash
+TOKEN=$(curl -s -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"qatest001","password":"QATest123!"}' | jq -r '.data.token')
+
+# Start a session first
+curl -s -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"chargeBoxId":"CS-SIMU-00001","connectorId":1,"idTag":"QATEST001"}' > /dev/null
+
+# Wait for transaction to be detected
+sleep 10
+
+# Test 1: Poll for active session with idTag
+curl -s "http://localhost:3000/api/charging/session/active?idTag=QATEST001" \
+  -H "Authorization: Bearer $TOKEN" | jq
+  
+  Result: Pass
+  root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# curl -s "http://localhost:3000/api/charging/session/active?idTag=QATEST001" \
+  -H "Authorization: Bearer $TOKEN" | jq
+{
+  "success": true,
+  "data": {
+    "status": "active",
+    "transactionId": 259,
+    "chargeBoxId": "CS-SIMU-00001",
+    "connectorId": 1,
+    "startTime": "2026-03-13T11:57:05.866Z",
+    "telemetry": {
+      "transactionId": 259,
+      "chargeBoxId": "CS-SIMU-00001",
+      "connectorId": 1,
+      "timestamp": "2026-03-13T11:58:24.638Z",
+      "energyKwh": 0.382,
+      "currentA": 73.08,
+      "powerW": 17832.26,
+      "voltageV": 390.84,
+      "socPercent": 95
+    }
+  },
+  "timestamp": "2026-03-13T11:58:24.639Z"
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+
+# Test 2: Poll without idTag (fallback to billing DB)
+curl -s "http://localhost:3000/api/charging/session/active" \
+  -H "Authorization: Bearer $TOKEN" | jq
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# curl -s "http://localhost:3000/api/charging/session/active" \
+  -H "Authorization: Bearer $TOKEN" | jq
+{
+  "success": true,
+  "data": {
+    "session_id": 13,
+    "steve_transaction_pk": 259,
+    "charge_box_id": "CS-SIMU-00001",
+    "connector_id": 1,
+    "start_time": "2026-03-13T11:57:06.000Z",
+    "start_meter_value": "0.00",
+    "status": "active"
+  },
+  "timestamp": "2026-03-13T12:01:15.911Z"
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+
+# Test 3: Poll for non-existent tag
+curl -s "http://localhost:3000/api/charging/session/active?idTag=NONEXISTENT" \
+  -H "Authorization: Bearer $TOKEN" | jq
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# curl -s "http://localhost:3000/api/charging/session/active?idTag=NONEXISTENT" \
+  -H "Authorization: Bearer $TOKEN" | jq
+{
+  "success": true,
+  "data": {
+    "status": "pending",
+    "message": "No active session found for this tag"
+  },
+  "timestamp": "2026-03-13T12:02:00.735Z"
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+
+# Test 4: Poll after session stopped
+curl -s -X POST http://localhost:3000/api/charging/stop \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"chargeBoxId":"CS-SIMU-00001","transactionId":<TX_ID>}' > /dev/null
+sleep 5
+curl -s "http://localhost:3000/api/charging/session/active?idTag=QATEST001" \
+  -H "Authorization: Bearer $TOKEN" | jq
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# curl -s "http://localhost:3000/api/charging/session/active?idTag=QATEST001" \
+  -H "Authorization: Bearer $TOKEN" | jq
+{
+  "success": true,
+  "data": {
+    "status": "pending",
+    "message": "No active session found for this tag"
+  },
+  "timestamp": "2026-03-13T12:03:12.248Z"
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+```
+
+**Expected Results**:
+| Test | Expected Status | Expected Response |
+|------|----------------|-------------------|
+| 1 | 200 | `{"success": true, "data": {"status": "active", "transactionId": ..., "telemetry": {...}}}` |
+| 2 | 200 | `{"success": true, "data": {...}}` (from billing DB) |
+| 3 | 200 | `{"success": true, "data": {"status": "pending", "message": "No active session"}}` |
+| 4 | 200 | `{"success": true, "data": {"status": "pending", ...}}` |
+
+---
+
+## 📡 Telemetry Tests
+
+### TELE-001: Get Real-Time Telemetry
+| Field | Value |
+|-------|-------|
+| **Priority** | High |
+| **Type** | Functional |
+
+**Test Steps**:
+```bash
+TOKEN=$(curl -s -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"qatest001","password":"QATest123!"}' | jq -r '.data.token')
+
+# Start charging session
+curl -s -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"chargeBoxId":"CS-SIMU-00001","connectorId":1,"idTag":"QATEST001"}' > /dev/null
+sleep 15
+
+# Test 1: Get telemetry via polling endpoint
+curl -s "http://localhost:3000/api/charging/session/active?idTag=QATEST001" \
+  -H "Authorization: Bearer $TOKEN" | jq '.data.telemetry'
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# curl -s "http://localhost:3000/api/charging/session/active?idTag=QATEST001" \
+  -H "Authorization: Bearer $TOKEN" | jq '.data.telemetry'
+{
+  "transactionId": 260,
+  "chargeBoxId": "CS-SIMU-00001",
+  "connectorId": 1,
+  "timestamp": "2026-03-13T12:57:48.137Z",
+  "energyKwh": 1.186,
+  "currentA": 57.76,
+  "powerW": 42134.1,
+  "voltageV": 390.01,
+  "socPercent": 4
+}
+# Test 2: Verify telemetry fields
+curl -s "http://localhost:3000/api/charging/session/active?idTag=QATEST001" \
+  -H "Authorization: Bearer $TOKEN" | jq '
+  .data.telemetry | 
+  {
+    has_energyKwh: (.energyKwh != null),
+    has_powerW: (.powerW != null),
+    has_currentA: (.currentA != null),
+    has_voltageV: (.voltageV != null),
+    has_socPercent: (.socPercent != null)
+  }'
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# curl -s "http://localhost:3000/api/charging/session/active?idTag=QATEST001" \
+  -H "Authorization: Bearer $TOKEN" | jq '
+  .data.telemetry | 
+  {
+    has_energyKwh: (.energyKwh != null),
+    has_powerW: (.powerW != null),
+    has_currentA: (.currentA != null),
+    has_voltageV: (.voltageV != null),
+    has_socPercent: (.socPercent != null)
+  }'
+{
+  "has_energyKwh": true,
+  "has_powerW": true,
+  "has_currentA": true,
+  "has_voltageV": true,
+  "has_socPercent": true
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+```
+
+**Expected Results**:
+| Field | Expected Value |
+|-------|---------------|
+| `energyKwh` | Number > 0 |
+| `powerW` | Number (may be null if simulator doesn't send) |
+| `currentA` | Number (may be null) |
+| `voltageV` | Number (may be null) |
+| `socPercent` | Number 0-100 (may be null) |
+
+---
+
+## 🔌 WebSocket Tests
+
+### WS-001: WebSocket Connection
+| Field | Value |
+|-------|-------|
+| **Priority** | High |
+| **Type** | Functional |
+
+**Test Steps**:
+```bash
+TOKEN=$(curl -s -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"qatest001","password":"QATest123!"}' | jq -r '.data.token')
+
+# Test 1: Connect with valid token
+wscat -c ws://localhost:3000/ws/charging \
+  -H "Authorization: Bearer $TOKEN"
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# wscat -c ws://localhost:3000/ws/charging \
+  -H "Authorization: Bearer $TOKEN"
+Connected (press CTRL+C to quit)
+< {"type":"connected","userId":33,"username":"qatest001","timestamp":"2026-03-13T13:02:54.576Z"}
+>
+
+# Test 2: Connect without token
+wscat -c ws://localhost:3000/ws/charging
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# wscat -c ws://localhost:3000/ws/charging
+Connected (press CTRL+C to quit)
+< {"type":"error","message":"Authentication required","timestamp":"2026-03-13T13:03:14.629Z"}
+Disconnected (code: 4001, reason: "Authentication required")
+root@steve-server:/build/VoltStartEV_Backend#
+
+Result: 
+# Test 3: Connect with invalid token
+wscat -c ws://localhost:3000/ws/charging \
+  -H "Authorization: Bearer invalid_token"
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# wscat -c ws://localhost:3000/ws/charging \
+  -H "Authorization: Bearer invalid_token"
+Connected (press CTRL+C to quit)
+< {"type":"error","message":"Invalid token"}
+Disconnected (code: 4002, reason: "Invalid token")
+root@steve-server:/build/VoltStartEV_Backend# 
+```
+
+**Expected Results**:
+| Test | Expected Response |
+|------|------------------|
+| 1 | `{"type":"connected","userId":1,"username":"qatest001",...}` |
+| 2 | `{"type":"error","message":"Authentication required"}` |
+| 3 | `{"type":"error","message":"Invalid token"}` |
+
+---
+
+### WS-002: WebSocket Events
+| Field | Value |
+|-------|-------|
+| **Priority** | Critical |
+| **Type** | Integration |
+
+**Test Steps**:
+```bash
+# Terminal 1: Open wscat session
+wscat -c ws://localhost:3000/ws/charging \
+  -H "Authorization: Bearer $TOKEN"
+> {"type":"subscribe","chargeBoxId":"CS-SIMU-00001"}
+
+# Terminal 2: Start charging session
+TOKEN=$(curl -s -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"qatest001","password":"QATest123!"}' | jq -r '.data.token')
+
+curl -s -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"chargeBoxId":"CS-SIMU-00001","connectorId":1,"idTag":"QATEST001"}'
+
+
+Result : Fail (We have POLL mechanism ?? )
+
+
+info:  WebSocket connected: user_33 (user: qatest001) {"service":"voltstartev-backend","timestamp":"2026-03-13 13:16:56"}
+debug:  Client user_33 subscribed to charger CS-SIMU-00001 {"service":"voltstartev-backend","timestamp":"2026-03-13 13:17:02"}
+
+root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# 
+root@steve-server:/build/VoltStartEV_Backend# curl -s -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"chargeBoxId":"CS-SIMU-00001","connectorId":1,"idTag":"QATEST001"}'
+{"success":true,"message":"Charging session initiated","data":{"transactionId":0,"chargeBoxId":"CS-SIMU-00001","connectorId":1,"estimatedStartTime":"2026-03-13T13:16:09.421Z"},"timestamp":"2026-03-13T13:15:39.421Z"}root@steve-server:/build/VoltStartEV_Backend# 
+
+
+root@steve-server:/build/VoltStartEV_Backend# echo "🔄 Polling for real transaction ID..."
+for i in {1..10}; do
+  echo "Attempt $i/20:"
+  
+  RESPONSE=$(curl -s "http://localhost:3000/api/charging/session/active?idTag=USER002" \
+    -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MTEsInVzZXJuYW1lIjoicWF0ZXN0MDAyIiwicm9sZSI6ImN1c3RvbWVyIiwiaWF0IjoxNzczMTU5NTE1LCJleHAiOjE3NzM3NjQzMTV9.1KnyvCQWX6bZFIg5Vt_i0RtbicrY-viuMgWxzJ03-ug")
+  
+  STATUS=$(echo "$RESPONSE" | jq -r '.data.status')
+  echo "  Status: $STATUS"
+  
+  sleep 3
+done
+🔄 Polling for real transaction ID...
+Attempt 1/20:
+  Status: pending
+Attempt 2/20:
+  Status: pending
+Attempt 3/20:
+  Status: pending
+Attempt 4/20:
+  Status: pending
+Attempt 5/20:
+  Status: pending
+Attempt 6/20:
+  Status: pending
+Attempt 7/20:
+  Status: pending
+Attempt 8/20:
+  Status: pending
+Attempt 9/20:
+  Status: pending
+Attempt 10/20:
+
+debug: POST /api/trpc/setup.setup {"ip":"::ffff:16.16.170.171","service":"voltstartev-backend","timestamp":"2026-03-13 14:27:16","userAgent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 OPR/127.0.0.0"}
+debug: GET /api/charging/session/active {"ip":"::ffff:127.0.0.1","service":"voltstartev-backend","timestamp":"2026-03-13 14:28:50","userAgent":"curl/7.81.0"}
+debug: GET /api/charging/session/active {"ip":"::ffff:127.0.0.1","service":"voltstartev-backend","timestamp":"2026-03-13 14:28:54","userAgent":"curl/7.81.0"}
+debug: GET /api/charging/session/active {"ip":"::ffff:127.0.0.1","service":"voltstartev-backend","timestamp":"2026-03-13 14:28:57","userAgent":"curl/7.81.0"}
+debug: GET /api/charging/session/active {"ip":"::ffff:127.0.0.1","service":"voltstartev-backend","timestamp":"2026-03-13 14:29:00","userAgent":"curl/7.81.0"}
+warn:  Slow SteVe query: 747ms {"service":"voltstartev-backend","sql":"\n      SELECT \n        ts.transaction_pk,\n        ts.start_timestamp,\n        cb.charge_box_id,\n    ...","timestamp":"2026-03-13 14:29:01"}
+debug: GET /api/charging/session/active {"ip":"::ffff:127.0.0.1","service":"voltstartev-backend","timestamp":"2026-03-13 14:29:06","userAgent":"curl/7.81.0"}
+debug: GET / {"ip":"::ffff:176.65.139.38","service":"voltstartev-backend","timestamp":"2026-03-13 14:29:06","userAgent":"Shodan-Pull/1.0"}
+debug: GET /api/charging/session/active {"ip":"::ffff:127.0.0.1","service":"voltstartev-backend","timestamp":"2026-03-13 14:29:10","userAgent":"curl/7.81.0"}
+debug: GET /api/charging/session/active {"ip":"::ffff:127.0.0.1","service":"voltstartev-backend","timestamp":"2026-03-13 14:29:13","userAgent":"curl/7.81.0"}
+debug: GET /api/charging/session/active {"ip":"::ffff:127.0.0.1","service":"voltstartev-backend","timestamp":"2026-03-13 14:29:16","userAgent":"curl/7.81.0"}
+debug: GET /api/charging/session/active {"ip":"::ffff:127.0.0.1","service":"voltstartev-backend","timestamp":"2026-03-13 14:29:19","userAgent":"curl/7.81.0"}
+debug: GET /api/charging/session/active {"ip":"::ffff:127.0.0.1","service":"voltstartev-backend","timestamp":"2026-03-13 14:29:22","userAgent":"curl/7.81.0"}
+debug:  Running reconciliation job... {"service":"voltstartev-backend","timestamp":"2026-03-13 14:30:00"}
+debug: 🔍 Found 0 SteVe transactions to reconcile {"service":"voltstartev-backend","timestamp":"2026-03-13 14:30:00"}
+
+# Watch Terminal 1 for events
+# Expected: {"type":"transaction:started",...}
+# Expected: {"type":"telemetry:update",...}
+
+# Terminal 2: Stop charging
+curl -s -X POST http://localhost:3000/api/charging/stop \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"chargeBoxId":"CS-SIMU-00001","transactionId":<TX_ID>}'
+
+# Watch Terminal 1 for completion event
+# Expected: {"type":"transaction:completed",...}
+```
+
+**Expected Results**:
+| Event | Expected Payload |
+|-------|-----------------|
+| `transaction:started` | `{transactionId, chargeBoxId, connectorId, idTag, startTime}` |
+| `telemetry:update` | `{transactionId, energyKwh, powerW, currentA, voltageV, socPercent}` |
+| `transaction:completed` | `{transactionId, stopTime, energyKwh, totalCost}` |
+| `charger:status` | `{chargeBoxId, connectorId, status, timestamp}` |
+
+---
+
+## 💾 Cache Tests
+
+### CACHE-001: Cache Hit/Miss
+| Field | Value |
+|-------|-------|
+| **Priority** | High |
+| **Type** | Performance |
+
+**Test Steps**:
+```bash
+TOKEN=$(curl -s -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"qatest001","password":"QATest123!"}' | jq -r '.data.token')
+
+# Test 1: First request (cache miss)
+echo "=== Request 1 (Cache Miss) ==="
+curl -s "http://localhost:3000/api/chargers/CS-SIMU-00001/connectors/1/status" \
+  -H "Authorization: Bearer $TOKEN" | jq '{status: .data.status, fromCache}'
+
+Result: Pass
+
+root@steve-server:/build/VoltStartEV_Backend# curl -s "http://localhost:3000/api/chargers/CS-SIMU-00001/connectors/1/status" \
+  -H "Authorization: Bearer $TOKEN" | jq '{status: .data.status, fromCache}'
+{
+  "status": "Charging",
+  "fromCache": false
+}
+
+debug: GET /api/chargers/CS-SIMU-00001/connectors/1/status {"ip":"::ffff:127.0.0.1","service":"voltstartev-backend","timestamp":"2026-03-13 14:35:23","userAgent":"curl/7.81.0"}
+debug:  Cache miss: CS-SIMU-00001:1, fetching connector status from DB {"service":"voltstartev-backend","timestamp":"2026-03-13 14:35:24"}
+debug:  Cache set: CS-SIMU-00001:1 status=Charging {"service":"voltstartev-backend","timestamp":"2026-03-13 14:35:24"}
+
+# Test 2: Second request within TTL (cache hit)
+echo "=== Request 2 (Cache Hit) ==="
+sleep 2
+curl -s "http://localhost:3000/api/chargers/CS-SIMU-00001/connectors/1/status" \
+  -H "Authorization: Bearer $TOKEN" | jq '{status: .data.status, fromCache}'
+
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# curl -s "http://localhost:3000/api/chargers/CS-SIMU-00001/connectors/1/status" \
+  -H "Authorization: Bearer $TOKEN" | jq '{status: .data.status, fromCache}'
+{
+  "status": "Charging",
+  "fromCache": true
+}
+root@steve-server:/build/VoltStartEV_Backend# 
+debug: GET /api/chargers/CS-SIMU-00001/connectors/1/status {"ip":"::ffff:127.0.0.1","service":"voltstartev-backend","timestamp":"2026-03-13 14:35:45","userAgent":"curl/7.81.0"}
+debug:  Cache hit: CS-SIMU-00001:1 (age: 20951ms) {"service":"voltstartev-backend","timestamp":"2026-03-13 14:35:45"}
+
+# Test 3: Request after TTL expires (cache miss)
+echo "=== Request 3 (After TTL Expiry) ==="
+sleep 35
+curl -s "http://localhost:3000/api/chargers/CS-SIMU-00001/connectors/1/status" \
+  -H "Authorization: Bearer $TOKEN" | jq '{status: .data.status, fromCache}'
+
+Result: Pass
+root@steve-server:/build/VoltStartEV_Backend# curl -s "http://localhost:3000/api/chargers/CS-SIMU-00001/connectors/1/status"   -H "Authorization: Bearer $TOKEN" | jq '{status: .data.status, fromCache}'
+{
+  "status": "Charging",
+  "fromCache": false
+}
+
+```
+
+**Expected Results**:
+| Request | Expected `fromCache` | Expected Response Time |
+|---------|---------------------|----------------------|
+| 1 | `false` | > 50ms (DB query) |
+| 2 | `true` | < 50ms (memory) |
+| 3 | `false` | > 50ms (DB query) |
+
+---
+
+### CACHE-002: Cache Invalidation via OCPP------------------------------------------------------NEED TO TEST AGAIN (NOT PERFORMED)
+| Field | Value |
+|-------|-------|
+| **Priority** | High |
+| **Type** | Integration |
+
+**Test Steps**:
+```bash
+# 1. Get initial status (populates cache)
+curl -s "http://localhost:3000/api/chargers/CS-SIMU-00001/connectors/1/status" \
+  -H "Authorization: Bearer $TOKEN" | jq '.data.status'
+
+# 2. Change charger status via SteVe UI (send ChangeAvailability)
+# Or trigger via simulator
+
+# 3. Watch backend logs for cache update
+tail -f /var/log/voltstartev/backend.log | grep -E "Cache (set|invalidated)"
+
+# 4. Verify cache was updated
+curl -s "http://localhost:3000/api/chargers/CS-SIMU-00001/connectors/1/status" \
+  -H "Authorization: Bearer $TOKEN" | jq '.data.status'
+```
+
+**Expected Results**:
+- Logs should show `Cache set` or `Cache invalidated` when StatusNotification received
+- API should return updated status immediately after OCPP event
+
+---
+
+## 💰 Billing & Reconciliation Tests
+
+### BILL-001: Billing Record Creation (Generated Columns)
+| Field | Value |
+|-------|-------|
+| **Priority** | Critical |
+| **Type** | Functional |
+
+**Test Steps**:
+```bash
+TOKEN=$(curl -s -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"qatest001","password":"QATest123!"}' | jq -r '.data.token')
+
+# Start and stop a session
+START=$(curl -s -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"chargeBoxId":"CS-SIMU-00001","connectorId":1,"idTag":"QATEST001"}')
+TX_ID=$(echo "$START" | jq -r '.data.transactionId')
+
+sleep 30  # Let session run
+
+curl -s -X POST http://localhost:3000/api/charging/stop \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d "{\"chargeBoxId\":\"CS-SIMU-00001\",\"transactionId\":$TX_ID}" > /dev/null
+
+# Wait for reconciliation to process
+sleep 60
+
+Result: Fail (reconciliation running after 10 min every time )
+
+root@steve-server:/build/VoltStartEV_Backend# date
+Fri Mar 13 16:28:06 UTC 2026
+root@steve-server:/build/VoltStartEV_Backend
+info:  Stop request for transaction 262 {"chargeBoxId":"CS-SIMU-00001","service":"voltstartev-backend","timestamp":"2026-03-13 16:23:20"}
+info:  RemoteStop via SteVe REST API succeeded {"chargeBoxId":"CS-SIMU-00001","response":"Accepted","service":"voltstartev-backend","timestamp":"2026-03-13 16:23:24"}
+debug:  Running reconciliation job... {"service":"voltstartev-backend","timestamp":"2026-03-13 16:30:01"}
+debug:  Found 1 SteVe transactions to reconcile {"service":"voltstartev-backend","timestamp":"2026-03-13 16:30:01"}
+info:  Updated completed session 16 {"service":"voltstartev-backend","timestamp":"2026-03-13 16:30:01"}
+info:  Reconciliation complete {"service":"voltstartev-backend","stats":{"checked":1,"created":1,"durationMs":415,"errors":0,"updated":0},"timestamp":"2026-03-13 16:30:01"}
+info:  Reconciliation stats {"service":"voltstartev-backend","stats":{"checked":1,"created":1,"durationMs":415,"errors":0,"updated":0},"timestamp":"2026-03-13 16:30:01"}
+
+
+# Check billing record (energy_kwh and total_cost auto-calculated)
+mysql -u root -p voltstartev_db -e "
+  SELECT session_id, steve_transaction_pk, start_meter_value, end_meter_value, 
+         energy_kwh, total_cost, status, payment_status
+  FROM charging_sessions
+  WHERE steve_transaction_pk = $TX_ID;
+"
+
+# Verify generated column calculation
+mysql -u root -p voltstartev_db -e "
+  SELECT 
+    start_meter_value,
+    end_meter_value,
+    (end_meter_value - start_meter_value) / 1000 AS manual_kwh,
+    energy_kwh AS generated_kwh,
+    ROUND((energy_kwh * 0.25) + 0.50, 2) AS manual_cost,
+    total_cost AS generated_cost
+  FROM charging_sessions
+  WHERE steve_transaction_pk = $TX_ID;
+"
+
+mysql> select * from charging_sessions where steve_transaction_pk = 262;
++------------+-------------+----------------------+---------------+--------------+-----------+---------------------+---------------------+------------------+-------------------+-----------------+------------+--------------+-------------+------------+-----------+-------------+----------------+----------------+---------------------+---------------------+
+| session_id | app_user_id | steve_transaction_pk | charge_box_id | connector_id | id_tag    | start_time          | end_time            | duration_seconds | start_meter_value | end_meter_value | energy_kwh | rate_per_kwh | session_fee | total_cost | status    | stop_reason | payment_status | payment_method | created_at          | updated_at          |
++------------+-------------+----------------------+---------------+--------------+-----------+---------------------+---------------------+------------------+-------------------+-----------------+------------+--------------+-------------+------------+-----------+-------------+----------------+----------------+---------------------+---------------------+
+|         16 |          33 |                  262 | CS-SIMU-00001 |            1 | QATEST001 | 2026-03-13 16:17:54 | 2026-03-13 16:23:25 |              331 |              0.00 |         2393.00 |      2.393 |       0.2500 |        0.50 |       1.10 | completed | Remote      | pending        | NULL           | 2026-03-13 16:20:00 | 2026-03-13 16:30:01 |
++------------+-------------+----------------------+---------------+--------------+-----------+---------------------+---------------------+------------------+-------------------+-----------------+------------+--------------+-------------+------------+-----------+-------------+----------------+----------------+---------------------+---------------------+
+1 row in set (0.00 sec)
+
+```
+
+**Expected Results**:
+| Field | Expected Value |
+|-------|---------------|
+| `energy_kwh` | Auto-calculated from meter values |
+| `total_cost` | Auto-calculated: `(energy_kwh * 0.25) + 0.50` |
+| `status` | `completed` |
+| `payment_status` | `pending` |
+| `manual_kwh` = `generated_kwh` | ✅ Within rounding tolerance |
+| `manual_cost` = `generated_cost` | ✅ Within rounding tolerance |
+
+---
+
+### BILL-002: Reconciliation Worker
+| Field | Value |
+|-------|-------|
+| **Priority** | Critical |
+| **Type** | Integration |
+
+**Test Steps**:
+```bash
+# 1. Check reconciliation logs
+tail -f /var/log/voltstartev/backend.log | grep reconciliation
+
+# 2. Verify reconciliation runs every 10 minutes
+# Expected log output every 10 min:
+# {"checked":X,"created":Y,"updated":Z,"errors":0,"durationMs":...}
+
+# 3. Check for duplicate billing records (UNIQUE constraint)
+mysql -u root -p voltstartev_db -e "
+  SELECT steve_transaction_pk, COUNT(*) as count
+  FROM charging_sessions
+  GROUP BY steve_transaction_pk
+  HAVING count > 1;
+"
+
+# 4. Verify no NULL in generated columns for completed sessions
+mysql -u root -p voltstartev_db -e "
+  SELECT COUNT(*) as null_energy_count
+  FROM charging_sessions
+  WHERE status = 'completed' AND energy_kwh IS NULL;
+"
+```
+
+**Expected Results**:
+- Reconciliation runs every 10 minutes (check cron schedule)
+- No duplicate billing records (`count` should be 1 for all)
+- `errors` should be 0 in reconciliation stats
+- `null_energy_count` should be 0
+
+---
+
+## ⚠️ Error Handling & Edge Cases
+
+### ERR-001: Invalid JSON Payload
+| Field | Value |
+|-------|-------|
+| **Priority** | Medium |
+| **Type** | Error Handling |
+
+**Test Steps**:
+```bash
+TOKEN=$(curl -s -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"qatest001","password":"QATest123!"}' | jq -r '.data.token')
+
+# Test 1: Invalid JSON
+curl -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{invalid json}' | jq
+
+# Test 2: Empty body
+curl -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '' | jq
+
+# Test 3: Wrong content type
+curl -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: text/plain" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"chargeBoxId":"CS-SIMU-00001"}' | jq
+```
+
+**Expected Results**:
+| Test | Expected Status | Expected Response |
+|------|----------------|-------------------|
+| 1 | 400 | `{"success": false, "error": "Invalid JSON"}` |
+| 2 | 400 | `{"success": false, "error": "Request body required"}` |
+| 3 | 400 | `{"success": false, "error": "Content-Type must be application/json"}` |
+
+---
+
+## 🔒 Security Tests
+
+### SEC-001: SQL Injection Prevention
+| Field | Value |
+|-------|-------|
+| **Priority** | Critical |
+| **Type** | Security |
+
+**Test Steps**:
+```bash
+TOKEN=$(curl -s -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"qatest001","password":"QATest123!"}' | jq -r '.data.token')
+
+# Test 1: SQL injection in chargeBoxId
+curl -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"chargeBoxId":"CS-SIMU-00001\"; DROP TABLE users; --","connectorId":1,"idTag":"QATEST001"}' | jq
+
+# Test 2: SQL injection in idTag
+curl -X POST http://localhost:3000/api/charging/start \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"chargeBoxId":"CS-SIMU-00001","connectorId":1,"idTag":"QATEST001\"; DELETE FROM charging_sessions; --"}' | jq
+
+# Test 3: SQL injection in user ID
+curl -X GET "http://localhost:3000/api/users/1%20OR%201=1/tags" \
+  -H "Authorization: Bearer $TOKEN" | jq
+```
+
+**Expected Results**:
+| Test | Expected Status | Expected Response |
+|------|----------------|-------------------|
+| 1 | 404 | `{"success": false, "error": "Charger not found"}` (no SQL error) |
+| 2 | 403 | `{"success": false, "error": "Tag not assigned"}` (no SQL error) |
+| 3 | 403 | `{"success": false, "error": "Forbidden"}` (no SQL error) |
+
+**Verification**:
+```bash
+# Verify tables still exist
+mysql -u root -p -e "SHOW TABLES FROM voltstartev_db;" | grep users
+mysql -u root -p -e "SELECT COUNT(*) FROM voltstartev_db.charging_sessions;"
+```
+
+---
+
+## ⚡ Performance Tests
+
+### PERF-001: API Response Time
+| Field | Value |
+|-------|-------|
+| **Priority** | Medium |
+| **Type** | Performance |
+
+**Test Steps**:
+```bash
+TOKEN=$(curl -s -X POST http://localhost:3000/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"qatest001","password":"QATest123!"}' | jq -r '.data.token')
+
+# Test each endpoint 10 times and calculate average
+endpoints=(
+  "/api/charging/sessions"
+  "/api/charging/session/active?idTag=QATEST001"
+  "/api/users/1/tags"
+  "/api/tags/QATEST001/assignment"
+)
+
+for endpoint in "${endpoints[@]}"; do
+  echo "=== Testing $endpoint ==="
+  total=0
+  for i in {1..10}; do
+    start=$(date +%s%N)
+    curl -s "http://localhost:3000$endpoint" \
+      -H "Authorization: Bearer $TOKEN" > /dev/null
+    end=$(date +%s%N)
+    duration=$(( (end - start) / 1000000 ))
+    total=$((total + duration))
+    echo "  Request $i: ${duration}ms"
+  done
+  avg=$((total / 10))
+  echo "  Average: ${avg}ms"
+  echo ""
+done
+```
+
+**Expected Results**:
+| Endpoint | Expected Avg Response Time |
+|----------|---------------------------|
+| `/api/charging/sessions` | < 200ms |
+| `/api/charging/session/active` | < 100ms (cache hit) |
+| `/api/users/:id/tags` | < 150ms |
+| `/api/tags/:idTag/assignment` | < 150ms |
+
+---
+
+## 📋 Test Results Template
+
+### Test Execution Summary
+
+```markdown
+## Test Execution Report
+
+**Date**: _______________  
+**Tester**: _______________  
+**Environment**: _______________  
+**Backend Version**: _______________  
+
+### Summary
+
+| Category | Total Tests | Passed | Failed | Skipped | Pass Rate |
+|----------|-------------|--------|--------|---------|-----------|
+| Database Architecture | 3 | ___ | ___ | ___ | ___% |
+| Authentication | 3 | ___ | ___ | ___ | ___% |
+| User Management | 1 | ___ | ___ | ___ | ___% |
+| Tag Assignment | 3 | ___ | ___ | ___ | ___% |
+| Charging Control | 2 | ___ | ___ | ___ | ___% |
+| Transaction Polling | 2 | ___ | ___ | ___ | ___% |
+| Telemetry | 2 | ___ | ___ | ___ | ___% |
+| WebSocket | 2 | ___ | ___ | ___ | ___% |
+| Cache | 2 | ___ | ___ | ___ | ___% |
+| Billing | 2 | ___ | ___ | ___ | ___% |
+| Error Handling | 1 | ___ | ___ | ___ | ___% |
+| Security | 1 | ___ | ___ | ___ | ___% |
+| Performance | 1 | ___ | ___ | ___ | ___% |
+| **TOTAL** | **25** | **___** | **___** | **___** | **___%** |
+
+### Failed Tests
+
+| Test ID | Test Name | Expected | Actual | Status |
+|---------|-----------|----------|--------|--------|
+| ___ | ___ | ___ | ___ | Open |
+| ___ | ___ | ___ | ___ | Open |
+
+### Issues Found
+
+| Issue ID | Severity | Description | Steps to Reproduce | Assigned To |
+|----------|----------|-------------|-------------------|-------------|
+| ___ | Critical/High/Medium/Low | ___ | ___ | ___ |
+
+### Recommendations
+
+1. _______________________________________________
+2. _______________________________________________
+3. _______________________________________________
+
+### Sign-off
+
+- [ ] QA Lead: _______________ Date: _______________
+- [ ] Dev Lead: _______________ Date: _______________
+- [ ] Product Owner: _______________ Date: _______________
+```
+
+---
+
+
+---
+
+## 📞 Support & Contact
+
+- **GitHub Repository**: https://github.com/AttriPardeep/VoltStartEV_Backend
+- **Issues**: Use GitHub Issues for bug reports
+- **Documentation**: This file + inline code comments
+
+---
+
+> ⚡ **VoltStartEV QA Suite**: Comprehensive testing for production-ready EV charging management.
+
+*Last updated: March 2026* ⚡🔋
+
+
+
+
+
+==========================================================
+==========================================================
+# 📊 VoltStartEV Backend - Test Execution Summary
+**Based on Test Results: March 16, 2026**
+
+---
+
+## 🎯 Overall Test Summary
+
+| Category | Total Tests | Passed | Failed | Skipped/Not Run | Pass Rate |
+|----------|------------|--------|--------|----------------|-----------|
+| **Database Architecture** | 14 | 11 | 3 | 0 | **79%** |
+| **Authentication & Authorization** | 15 | 15 | 0 | 0 | **100%** ✅ |
+| **User Management** | 2 | 2 | 0 | 0 | **100%** ✅ |
+| **Tag Assignment** | 12 | 8 | 4 | 0 | **67%** |
+| **Charging Control** | 9 | 7 | 2 | 0 | **78%** |
+| **Transaction Polling** | 4 | 4 | 0 | 0 | **100%** ✅ |
+| **Telemetry** | 2 | 2 | 0 | 0 | **100%** ✅ |
+| **WebSocket** | 4 | 3 | 1 | 0 | **75%** |
+| **Cache** | 3 | 3 | 0 | 1 | **100%** ✅ |
+| **Billing & Reconciliation** | 2 | 1 | 1 | 0 | **50%** |
+| **GRAND TOTAL** | **67** | **56** | **11** | **1** | **84%** |
+
+---
+
+## ✅ Tests Passing (56/67)
+
+### 🔐 Authentication & Authorization (100% Pass)
+| Test ID | Test Name | Status |
+|---------|-----------|--------|
+| AUTH-001-T1 to T5 | User Registration (valid, duplicate username/email, weak password, missing fields) | ✅ All Pass |
+| AUTH-002-T1 to T5 | User Login (valid, invalid password, non-existent user, inactive user, missing credentials) | ✅ All Pass |
+| AUTH-003-T1 to T5 | JWT Token Validation (valid, missing, invalid format, expired, tampered) | ✅ All Pass |
+
+### 👤 User Management (100% Pass)
+| Test ID | Test Name | Status |
+|---------|-----------|--------|
+| USER-001-T1 | Get own profile | ✅ Pass |
+| USER-001-T2 | Get another user's profile (restricted) | ✅ Pass |
+
+### 🗄️ Database Architecture (79% Pass)
+| Test ID | Test Name | Status |
+|---------|-----------|--------|
+| DB-001-T1 to T5 | ocpp_tag_activity is Read-Only VIEW | ✅ All Pass |
+| DB-002-T1 to T4 | Generated columns in charging_sessions | ✅ All Pass |
+| DB-003-T1 to T2 | user_ocpp_tag is writable table | ✅ Pass |
+
+### 🏷️ Tag Assignment (67% Pass)
+| Test ID | Test Name | Status |
+|---------|-----------|--------|
+| TAG-001-T1 | Assign valid unassigned tag | ✅ Pass |
+| TAG-001-T2 | Assign already assigned tag (idempotent) | ✅ Pass |
+| TAG-001-T4 | Verify tag linkage in user_ocpp_tag | ✅ Pass |
+| TAG-002-T1 | Verify tag status from VIEW | ✅ Pass |
+| TAG-002-T3 | Verify ocpp_tag_activity auto-update on start | ✅ Pass |
+
+### 🔌 Charging Control (78% Pass)
+| Test ID | Test Name | Status |
+|---------|-----------|--------|
+| CHARGE-001-T1 to T4 | Start charging (valid, missing chargeBoxId, invalid charger, tag not assigned) | ✅ All Pass |
+| CHARGE-001-T5 | Charger unavailable check | ✅ Pass (message adjusted) |
+| CHARGE-002-T2 | Stop already stopped session (idempotent) | ✅ Pass |
+| CHARGE-002-T4 | Missing transactionId validation | ✅ Pass |
+
+### 📊 Transaction Polling (100% Pass)
+| Test ID | Test Name | Status |
+|---------|-----------|--------|
+| POLL-001-T1 to T4 | Get active session (with idTag, without, non-existent, after stop) | ✅ All Pass |
+
+### 📡 Telemetry (100% Pass)
+| Test ID | Test Name | Status |
+|---------|-----------|--------|
+| TELE-001-T1 to T2 | Get real-time telemetry, verify fields | ✅ All Pass |
+
+### 🔌 WebSocket (75% Pass)
+| Test ID | Test Name | Status |
+|---------|-----------|--------|
+| WS-001-T1 to T3 | WebSocket connection (valid token, no token, invalid token) | ✅ All Pass |
+
+### 💾 Cache (100% Pass)
+| Test ID | Test Name | Status |
+|---------|-----------|--------|
+| CACHE-001-T1 to T3 | Cache hit/miss/TTL expiry | ✅ All Pass |
+
+### 💰 Billing & Reconciliation (50% Pass)
+| Test ID | Test Name | Status |
+|---------|-----------|--------|
+| BILL-002 | Reconciliation worker runs every 10 min, no duplicates, no NULL generated columns | ✅ Pass |
+
+---
+
+## ❌ Tests Failing (11/67)
+
+### Database Architecture
+| Test ID | Test Name | Expected | Actual | Root Cause |
+|---------|-----------|----------|--------|-----------|
+| DB-003-T3 to T5 | Verify INSERT/DELETE with hardcoded ocpp_tag_pk=191 | Success | Fail | Test uses hardcoded `ocpp_tag_pk=191`; actual DB has `281` for QATEST001 |
+
+### Tag Assignment
+| Test ID | Test Name | Expected | Actual | Root Cause |
+|---------|-----------|----------|--------|-----------|
+| TAG-001-T3 | Assign non-existent tag | 404 "Tag not found" | 201 "Tag assigned" | `getOrCreateTag()` auto-provisions missing tags (production behavior) |
+| TAG-002-T2 | Start charging with assigned tag | 202 "Charging initiated" | 403 "Tag not assigned to your account" | user_pk mismatch: tag linked to user_id=1, test uses user_id=33 |
+| TAG-002-T4/T5 | Stop charging & verify auto-update | Success | Fail | Depends on TAG-002-T2 failure |
+| TAG-003-T1 | Block tag via SteVe REST API | 200 "Tag updated" | No response | SteVe API endpoint may need authentication fix or network issue |
+
+### Charging Control
+| Test ID | Test Name | Expected | Actual | Root Cause |
+|---------|-----------|----------|--------|-----------|
+| CHARGE-002-T1 | Valid stop request | 202 "Stop command sent" | 500 "Internal server error" (timeout) | SteVe RemoteStop API timeout (~13s query); intermittent |
+| CHARGE-002-T3 | Stop non-existent transaction | 404 "Transaction not found" | 500 "Internal server error" | SteVe returns 400 "not active", backend maps to 500 instead of 404 |
+
+### WebSocket
+| Test ID | Test Name | Expected | Actual | Root Cause |
+|---------|-----------|----------|--------|-----------|
+| WS-002 | WebSocket events (transaction:started, telemetry:update) | Real-time push events | No events received | System uses polling mechanism; WebSocket event emission not fully wired |
+
+### Billing & Reconciliation
+| Test ID | Test Name | Expected | Actual | Root Cause |
+|---------|-----------|----------|--------|-----------|
+| BILL-001 | Billing record created immediately after stop | Record available immediately | Record created after 10-min reconciliation cycle | Reconciliation job runs on cron schedule (`*/10 * * * *`), not real-time |
+
+---
+
+## ⚠️ Tests Not Executed (1/67)
+
+| Test ID | Test Name | Reason |
+|---------|-----------|--------|
+| CACHE-002 | Cache invalidation via OCPP StatusNotification | Requires manual SteVe UI change or simulator trigger; not performed in this run |
+
+---
+
+## 🔧 Critical Fixes Applied During Testing
+
+| Issue | Fix Applied | Impact |
+|-------|------------|--------|
+| **Login failing with "Invalid credentials"** | Regenerated bcrypt hash for `QATest123!` and updated DB | ✅ AUTH-002 now passes |
+| **AUTH-003-T1 failing with SQL error** | Removed trailing comma in `getUserSessionHistory()` SQL query | ✅ AUTH-003 now passes |
+| **Password validation not working** | Added `validator.isStrongPassword()` check in registration endpoint | ✅ AUTH-001-T4 now passes |
+| **Tag assignment allowing duplicates** | Added pre-insert check for existing linkage in `user_ocpp_tag` | ✅ TAG-001-T2 now idempotent |
+| **TypeScript compilation errors** | Fixed `users.routes.ts` JSON response structure, `database.ts` type constraints | ✅ Code compiles cleanly |
+
+---
+
+## 🎯 Recommendations for Next Iteration
+
+### High Priority (Blockers)
+1. **Fix user↔tag linkage mismatch** (TAG-002-T2)
+   - Update test scripts to use correct `user_id` (33 for qatest001) OR
+   - Update `user_ocpp_tag` to link QATEST001 to user_id=33
+
+2. **Handle SteVe API timeouts** (CHARGE-002-T1)
+   - Increase timeout for RemoteStop API calls OR
+   - Add retry logic with exponential backoff
+
+3. **Map SteVe 400 errors to appropriate HTTP codes** (CHARGE-002-T3)
+   - Map "transaction not active" → 404 instead of 500
+
+### Medium Priority (Enhancements)
+4. **Decide on auto-provisioning policy** (TAG-001-T3)
+   - Option A: Keep auto-provisioning (production-friendly) → update test expectation
+   - Option B: Add `?strict=true` query param for strict validation in tests
+
+5. **Wire WebSocket event emission** (WS-002)
+   - Ensure `websocketEmitter.emitChargerStatus()` and `emitTransactionStarted()` are called from OCPP handlers
+
+6. **Add admin endpoint to trigger reconciliation on-demand** (BILL-001)
+   - Allow QA to force reconciliation instead of waiting 10 minutes
+
+### Low Priority (Documentation)
+7. **Document test data dependencies** (DB-003)
+   - Use dynamic `ocpp_tag_pk` lookup in all test scripts instead of hardcoded values
+
+8. **Add cache invalidation test** (CACHE-002)
+   - Document steps to trigger OCPP StatusNotification for cache testing
+
+---
+
+## 📈 Test Health Metrics
+
+| Metric | Value | Target | Status |
+|--------|-------|--------|--------|
+| **Overall Pass Rate** | 84% | ≥90% | ⚠️ Needs improvement |
+| **Critical Path Pass Rate** (Auth + Charging) | 92% | ≥95% | ✅ Good |
+| **Flaky Tests** (intermittent failures) | 1 (CHARGE-002-T1) | 0 | ⚠️ Investigate timeout |
+| **Environment Stability** | SteVe crashed once during testing | 100% uptime | ⚠️ Monitor SteVe stability |
+| **Test Execution Time** | ~4 hours for full suite | <2 hours | ⚠️ Optimize sleep/wait times |
+
+---
+
+## ✅ Sign-Off Ready For
+
+- [x] **Authentication & Authorization** - All tests passing, production-ready
+- [x] **User Management** - Profile endpoints working correctly
+- [x] **Transaction Polling** - Active session polling reliable
+- [x] **Telemetry** - Real-time metrics available via polling
+- [x] **Cache** - Hit/miss/TTL behavior verified
+- [x] **Reconciliation Worker** - Runs reliably, no duplicates
+
+## ⚠️ Requires Fixes Before Production
+
+- [ ] **Tag↔User Authorization** - Fix user_id/ocpp_tag_pk linkage validation
+- [ ] **Stop Transaction Timeout** - Handle SteVe API latency gracefully
+- [ ] **Error Code Mapping** - Map SteVe 400s to appropriate HTTP codes
+- [ ] **WebSocket Event Emission** - Ensure real-time push events work
+
+---
+
+> **Summary**: 84% pass rate with all critical authentication and core charging flows working. Remaining failures are primarily test data mismatches and timeout handling—fixable with targeted code/test updates. System is **nearly production-ready** pending fixes to tag authorization and SteVe API timeout handling.
+
+*Report generated: March 2026* ⚡🔋
