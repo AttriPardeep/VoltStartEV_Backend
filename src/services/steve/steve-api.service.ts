@@ -206,33 +206,49 @@ export class SteVeApiService {
   /**
    * Get or create a tag: fetch by idTag, create if not exists
    */
-async getOrCreateTag(
-  idTag: string,
-  defaults?: Partial<OcppTagForm>
-): Promise<SteVeApiResponse<OcppTagOverview>> {
-  const getResult = await this.getTagByIdTag(idTag);
-
-  // ✅ FIX: Check Array.isArray before accessing length
-  if (getResult.success && Array.isArray(getResult.data) && getResult.data.length > 0) {
-    logger.debug(`✅ Found existing tag: ${idTag}`);
-    return { success: true, data: getResult.data[0] };
+  async getOrCreateTag(
+    idTag: string,
+    defaults?: Partial<OcppTagForm>
+  ): Promise<SteVeApiResponse<OcppTagOverview>> {
+    try {
+      const getResult = await this.getTagByIdTag(idTag);
+  
+      // ✅ Check Array.isArray before accessing length
+      if (getResult.success && Array.isArray(getResult.data) && getResult.data.length > 0) {
+        logger.debug(` Found existing tag: ${idTag}`);
+        return { success: true, data: getResult.data[0] };
+      }
+  
+      logger.debug(` Tag not found, creating: ${idTag}`);
+  
+      const createResult = await this.createTag({
+        idTag,
+        maxActiveTransactionCount: 1,
+        note: defaults?.note || 'Provisioned by VoltStartEV app',
+        ...defaults,
+      });
+  
+      if (createResult.success) {
+        logger.info(`Created new tag: ${idTag} (PK: ${createResult.data?.ocppTagPk})`);
+      }
+  
+      return createResult;
+      
+    } catch (error: any) {
+      // ✅ Handle SteVe's "AlreadyExists" error (race condition: tag created between get and create)
+      if (error.name === 'AlreadyExists' || error.message?.includes('already exists')) {
+        logger.debug(` Tag ${idTag} was created concurrently, fetching it now`);
+        // Retry fetch once
+        const retryResult = await this.getTagByIdTag(idTag);
+        if (retryResult.success && Array.isArray(retryResult.data) && retryResult.data.length > 0) {
+          return { success: true, data: retryResult.data[0] };
+        }
+      }
+      
+      // Re-throw other errors
+      throw error;
+    }
   }
-
-  logger.debug(`🆕 Tag not found, creating: ${idTag}`);
-
-  const createResult = await this.createTag({
-    idTag,
-    maxActiveTransactionCount: 1,
-    note: defaults?.note || 'Provisioned by VoltStartEV app',
-    ...defaults,
-  });
-
-  if (createResult.success) {
-    logger.info(`✅ Created new tag: ${idTag} (PK: ${createResult.data?.ocppTagPk})`);
-  }
-
-  return createResult;
-}
   /**
    * Check if a tag exists via SteVe REST API
    */
@@ -250,5 +266,5 @@ export const steveApiService = new SteVeApiService({
   baseUrl: process.env.STEVE_API_URL || 'http://localhost:8080/steve',
   username: process.env.STEVE_API_USER || 'voltstart_backend',
   password: process.env.STEVE_API_PASS || '',
-  timeoutMs: parseInt(process.env.STEVE_API_TIMEOUT_MS || '10000'),
+  timeoutMs: parseInt(process.env.STEVE_API_TIMEOUT_MS || '30000'),
 });

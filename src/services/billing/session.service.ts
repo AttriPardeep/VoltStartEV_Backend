@@ -106,31 +106,48 @@ export async function completeBillingSession(data: SessionStopData): Promise<{
 /**
  * Get session history for a user
  */
-export async function getUserSessionHistory(
-  appUserId: number, 
+   export async function getUserSessionHistory(
+  appUserId: number,
   limit: number = 20
 ): Promise<Array<any>> {
-  const sessions = await appDbQuery(`
-    SELECT 
-      session_id,
-      charge_box_id,
-      connector_id,
-      id_tag,
-      start_time,
-      end_time,
-      duration_seconds,
-      energy_kwh,
-      total_cost,
-      status,
-      payment_status,
-      created_at
-    FROM charging_sessions
-    WHERE app_user_id = ?
-    ORDER BY start_time DESC
-    LIMIT ?
-  `, [appUserId, limit]);
 
-  return sessions;
+  // Ensure limit is numeric
+  const safeLimit =
+    typeof limit === 'number' ? limit : parseInt(String(limit), 10) || 20;
+
+  logger.debug('Fetching session history', { appUserId, limit: safeLimit });
+
+  try {
+
+    const sessions = await appDbQuery(`
+      SELECT 
+        session_id,
+        charge_box_id,
+        connector_id,
+        id_tag,
+        start_time,
+        end_time,
+        duration_seconds,
+        energy_kwh,
+        total_cost,
+        status,
+        payment_status,
+        created_at
+      FROM charging_sessions
+      WHERE app_user_id = ?
+      ORDER BY start_time DESC
+      LIMIT ${safeLimit}
+    `, [appUserId]);
+
+    return Array.isArray(sessions) ? sessions : [sessions];
+  } catch (error: any) {
+    logger.error('Failed to fetch session history', {
+      appUserId,
+      limit: safeLimit,
+      error: error instanceof Error ? { name: error.name, message: error.message, code: (error as any).code } : error
+    });
+    throw error;
+  }
 }
 
 /**

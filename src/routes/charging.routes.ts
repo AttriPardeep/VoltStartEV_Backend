@@ -20,7 +20,7 @@ const router = Router();
 
 // POST /api/charging/start - App-initiated charging session
 router.post('/start', authenticateJwt, async (req: Request, res: Response) => {
-  console.log(`⚡ RemoteStart request: chargeBoxId=${req.body.chargeBoxId}, connectorId=${req.body.connectorId}`);
+  console.log(` RemoteStart request: chargeBoxId=${req.body.chargeBoxId}, connectorId=${req.body.connectorId}`);
   
   try {
     const { chargeBoxId, connectorId, idTag } = req.body;
@@ -28,7 +28,7 @@ router.post('/start', authenticateJwt, async (req: Request, res: Response) => {
     const appUserId = reqWithUser.user?.id;
 
     if (!appUserId) {
-      logger.error('❌ appUserId is undefined - authentication failed', {
+      logger.error(' appUserId is undefined - authentication failed', {
         env: process.env.NODE_ENV,
         hasAuthHeader: !!req.headers.authorization,
         userAgent: req.headers['user-agent']
@@ -40,7 +40,7 @@ router.post('/start', authenticateJwt, async (req: Request, res: Response) => {
         timestamp: new Date().toISOString()
       });
     } 
-    // ✅ 1. Validate required fields FIRST (fail fast)
+    //  1. Validate required fields FIRST (fail fast)
     if (!chargeBoxId || !connectorId || !idTag) {
       return res.status(400).json({
         success: false,
@@ -50,7 +50,7 @@ router.post('/start', authenticateJwt, async (req: Request, res: Response) => {
       });
     }
     
-    // ✅ 2. Validate charger is available
+    //  2. Validate charger is available
     const chargerStatus = await getChargerStatus(chargeBoxId);
     if (chargerStatus.status !== 'Available') {
       return res.status(409).json({
@@ -61,7 +61,7 @@ router.post('/start', authenticateJwt, async (req: Request, res: Response) => {
       });
     }
     
-    // ✅ 3. Validate user↔tag mapping (includes tag validation internally)
+    //  3. Validate user↔tag mapping (includes tag validation internally)
     // This replaces the separate validateIdTag() call
     const authResult = await validateIdTagForUser(idTag, appUserId);
     if (authResult.status !== 'Accepted') {
@@ -73,7 +73,7 @@ router.post('/start', authenticateJwt, async (req: Request, res: Response) => {
       });
     }
     
-    // ✅ 4. Trigger RemoteStart via SteVe integration
+    //  4. Trigger RemoteStart via SteVe integration
     const result = await startChargingSession({
       chargeBoxId,
       connectorId: parseInt(connectorId),
@@ -107,7 +107,7 @@ router.post('/start', authenticateJwt, async (req: Request, res: Response) => {
 
 // POST /api/charging/stop - App-initiated stop charging session
 router.post('/stop', authenticateJwt, async (req: Request, res: Response) => {
-  console.log(`🛑 RemoteStop request: transactionId=${req.body.transactionId}`);
+  console.log(` RemoteStop request: transactionId=${req.body.transactionId}`);
   
   try {
     const { transactionId, chargeBoxId } = req.body;
