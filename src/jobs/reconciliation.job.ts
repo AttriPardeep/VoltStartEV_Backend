@@ -5,7 +5,7 @@ import logger from '../config/logger.js';
 
 export function startReconciliationJob() {
   // Run every 10 minutes
-  // const schedule = '*/10 * * * *';
+  // const schedule = '*/5 * * * *';
   const schedule = process.env.RECONCILIATION_SCHEDULE || '*/10 * * * *';
   const lookbackMinutes = parseInt(process.env.RECONCILIATION_LOOKBACK_MINUTES || '60');
   

@@ -1,32 +1,21 @@
 // src/config/database.ts
-import mysql, { RowDataPacket, ResultSetHeader, FieldPacket } from 'mysql2/promise';
+import mysql, { RowDataPacket, ResultSetHeader } from 'mysql2/promise';
 import logger from './logger.js';
-
-// ─────────────────────────────────────────────────────
-// Type Definitions for Clarity
-// ─────────────────────────────────────────────────────
-
-// For SELECT queries - returns array of row objects
-export type QueryResult<T = RowDataPacket> = T[];
-
-// For INSERT/UPDATE/DELETE - returns ResultSetHeader
-export type ExecuteResult = ResultSetHeader;
 
 // ─────────────────────────────────────────────────────
 // SteVe Database Connection (READ-ONLY)
 // ─────────────────────────────────────────────────────
 export const stevePool = mysql.createPool({
   host: process.env.STEVE_DB_HOST || 'localhost',
-  port: parseInt(process.env.STEVE_DB_PORT || '3306', 10),
-  user: process.env.STEVE_DB_USER || 'steve_readonly',
+  port: parseInt(process.env.STEVE_DB_PORT || '3306'),
+  user: process.env.STEVE_DB_USER || 'voltstartev',
   password: process.env.STEVE_DB_PASSWORD,
   database: process.env.STEVE_DB_NAME || 'stevedb',
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
-  ssl: process.env.NODE_ENV === 'development' 
-    ? { rejectUnauthorized: false } 
-    : undefined
+  enableKeepAlive: true,
+  keepAliveInitialDelay: 10000,
 });
 
 // ─────────────────────────────────────────────────────
@@ -34,120 +23,103 @@ export const stevePool = mysql.createPool({
 // ─────────────────────────────────────────────────────
 export const appPool = mysql.createPool({
   host: process.env.APP_DB_HOST || 'localhost',
-  port: parseInt(process.env.APP_DB_PORT || '3306', 10),
-  user: process.env.APP_DB_USER || 'voltstartev_user',
+  port: parseInt(process.env.APP_DB_PORT || '3306'),
+  user: process.env.APP_DB_USER || 'voltstartev',
   password: process.env.APP_DB_PASSWORD,
   database: process.env.APP_DB_NAME || 'voltstartev_db',
   waitForConnections: true,
   connectionLimit: 10,
-  queueLimit: 0
+  queueLimit: 0,
+  enableKeepAlive: true,
+  keepAliveInitialDelay: 10000,
 });
 
 // ─────────────────────────────────────────────────────
-// Query Functions with Proper Type Safety
+// Query Functions with Logging
 // ─────────────────────────────────────────────────────
 
 /**
- * Execute a SELECT query - returns array of row objects
- * Usage: const users = await appDbQuery<User>('SELECT * FROM users WHERE id = ?', [1]);
+ * Execute SELECT query against SteVe DB (READ-ONLY)
+ * Returns: Array of rows (T[])
  */
-export async function appDbQuery<T = RowDataPacket>(sql: string, params?: any[]): Promise<QueryResult<T>> {
+export async function steveQuery<T = RowDataPacket>(sql: string, params: any[] = []): Promise<T[]> {
   const start = Date.now();
   try {
-    // FIX: Don't use generic on execute(); let mysql2 infer types
-    // Then cast the result to our expected type
-    const [rows] = await appPool.execute(sql, params ? [...params] : []);
+    const [rows] = await stevePool.execute(sql, params);
     const duration = Date.now() - start;
     
     if (duration > 500) {
-      logger.warn(` Slow app DB query: ${duration}ms`, { sql: sql.substring(0, 100) + '...' });
+      logger.warn(` Slow SteVe query: ${duration}ms`, { 
+        sql: sql.substring(0, 100),
+        params 
+      });
     }
     
-    return rows as QueryResult<T>;
+    return rows as T[];
+  } catch (error: any) {
+    logger.error(' SteVe DB query failed', { 
+      error: error instanceof Error ? { name: error.name, message: error.message, code: (error as any).code } : error,
+      sql: sql.substring(0, 200),
+      params 
+    });
+    throw error;
+  }
+}
+
+/**
+ * Execute SELECT query against VoltStartEV App DB (READ/WRITE)
+ * Returns: Array of rows (T[])
+ */
+export async function appDbQuery<T = RowDataPacket>(sql: string, params: any[] = []): Promise<T[]> {
+  const start = Date.now();
+  try {
+    const [rows] = await appPool.execute(sql, params);
+    const duration = Date.now() - start;
+    
+    if (duration > 500) {
+      logger.warn(` Slow App DB query: ${duration}ms`, { 
+        sql: sql.substring(0, 100),
+        params 
+      });
+    }
+    
+    return rows as T[];
   } catch (error: any) {
     logger.error(' App DB query failed', { 
-      sql: sql.substring(0, 200) + '...',
-      params,
-      error: error instanceof Error ? { name: error.name, message: error.message, code: (error as any).code } : error
+      error: error instanceof Error ? { name: error.name, message: error.message, code: (error as any).code } : error,
+      sql: sql.substring(0, 200),
+      params 
     });
     throw error;
   }
 }
 
 /**
- * Execute an INSERT/UPDATE/DELETE query - returns ResultSetHeader
- * Usage: const result = await appDbExecute('INSERT INTO users (...) VALUES (...)', [values]);
- *        const insertId = result.insertId;
+ * Execute INSERT/UPDATE/DELETE against VoltStartEV App DB
+ * Returns: ResultSetHeader
  */
-export async function appDbExecute(sql: string, params?: any[]): Promise<ExecuteResult> {
+export async function appDbExecute(sql: string, params: any[] = []): Promise<ResultSetHeader> {
   const start = Date.now();
   try {
-    //  FIX: Spread readonly array to mutable array for mysql2
-    const [result] = await appPool.execute(sql, params ? [...params] : []);
+    const [result] = await appPool.execute(sql, params);
     const duration = Date.now() - start;
     
     if (duration > 500) {
-      logger.warn(` Slow app DB execute: ${duration}ms`, { sql: sql.substring(0, 100) + '...' });
+      logger.warn(` Slow App DB execute: ${duration}ms`, { 
+        sql: sql.substring(0, 100),
+        params 
+      });
     }
     
-    return result as ExecuteResult;
+    return result as ResultSetHeader;
   } catch (error: any) {
-    logger.error(' App DB execute failed', {
-      sql: sql.substring(0, 200) + '...',
-      params,
-      error: error instanceof Error ? { name: error.name, message: error.message, code: (error as any).code } : error
+    logger.error(' App DB execute failed', { 
+      error: error instanceof Error ? { name: error.name, message: error.message, code: (error as any).code } : error,
+      sql: sql.substring(0, 200),
+      params 
     });
     throw error;
   }
-}
-
-/**
- * Execute a read-only query against SteVe database
- * For SELECT: returns array of rows
- * For writes: returns ResultSetHeader (though writes to stevedb should be avoided)
- */
-export async function steveQuery<T = RowDataPacket>(sql: string, params?: any[]): Promise<QueryResult<T>> {
-  const start = Date.now();
-  try {
-    // FIX: Don't use generic on execute(); cast result instead
-    const [rows] = await stevePool.execute(sql, params ? [...params] : []);
-    const duration = Date.now() - start;
-    
-    if (duration > 500) {
-      logger.warn(` Slow SteVe query: ${duration}ms`, { sql: sql.substring(0, 100) + '...' });
-    }
-    
-    return rows as QueryResult<T>;
-  } catch (error: any) {
-    logger.error(' SteVe query failed', { 
-      sql: sql.substring(0, 200) + '...',
-      params,
-      error: error instanceof Error ? { name: error.name, message: error.message, code: (error as any).code } : error
-    });
-    throw error;
-  }
-}
-
-// ─────────────────────────────────────────────────────
-// Helper: Execute and return single row (convenience)
-// ─────────────────────────────────────────────────────
-
-/**
- * Execute a SELECT query that should return exactly one row
- * Returns null if no rows found
- */
-export async function appDbQueryOne<T = RowDataPacket>(sql: string, params?: any[]): Promise<T | null> {
-  const rows = await appDbQuery<T>(sql, params);
-  return rows.length > 0 ? rows[0] : null;
-}
-
-/**
- * Execute a SELECT query that should return exactly one row from SteVe DB
- * Returns null if no rows found
- */
-export async function steveQueryOne<T = RowDataPacket>(sql: string, params?: any[]): Promise<T | null> {
-  const rows = await steveQuery<T>(sql, params);
-  return rows.length > 0 ? rows[0] : null;
 }
 
 // ─────────────────────────────────────────────────────
@@ -160,9 +132,6 @@ export interface HealthCheckResult {
   timestamp: string;
 }
 
-/**
- * Check health of both database connections
- */
 export async function checkDatabaseHealth(): Promise<HealthCheckResult> {
   const result: HealthCheckResult = {
     steve: false,
@@ -170,7 +139,6 @@ export async function checkDatabaseHealth(): Promise<HealthCheckResult> {
     timestamp: new Date().toISOString()
   };
   
-  // Check SteVe database
   try {
     const steveConn = await stevePool.getConnection();
     await steveConn.ping();
@@ -183,7 +151,6 @@ export async function checkDatabaseHealth(): Promise<HealthCheckResult> {
     });
   }
   
-  // Check App database
   try {
     const appConn = await appPool.getConnection();
     await appConn.ping();
@@ -199,11 +166,15 @@ export async function checkDatabaseHealth(): Promise<HealthCheckResult> {
   return result;
 }
 
-/**
- * Close all database connections gracefully
- */
+let poolsClosed = false;
 export async function closeAllConnections(): Promise<void> {
-  logger.info('🔌 Closing database connections...');
+  if (poolsClosed) {
+    logger.debug(' Database pools already closed, skipping');
+    return;
+  }
+  
+  poolsClosed = true;
+  logger.info(' Closing database connections...');
   
   try {
     // Close pools in parallel, but handle errors individually

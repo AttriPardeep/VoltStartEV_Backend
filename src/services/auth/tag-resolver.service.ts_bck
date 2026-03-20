@@ -1,0 +1,38 @@
+// src/services/auth/tag-resolver.service.ts
+import { steveQuery } from '../../config/database.js';
+import logger from '../../config/logger.js';
+
+/**
+ * Resolve app user_id from RFID tag via SteVe DB linkage
+ * Returns null if tag is not assigned to any user
+ * 
+ * This is called in webhook handlers for REAL-TIME WebSocket emit
+ * (instead of waiting for 10-min reconciliation)
+ */
+export async function resolveUserIdForTag(idTag: string): Promise<number | null> {
+  if (!idTag) return null;
+  
+  try {
+    const [linkage] = await steveQuery(`
+      SELECT uot.user_pk as app_user_id
+      FROM user_ocpp_tag uot
+      JOIN ocpp_tag ot ON ot.ocpp_tag_pk = uot.ocpp_tag_pk
+      WHERE ot.id_tag = ? AND uot.user_pk IS NOT NULL
+      LIMIT 1
+    `, [idTag]);
+    
+    const userId = linkage?.app_user_id;
+    
+    if (userId) {
+      logger.debug(` Resolved userId ${userId} for tag ${idTag}`);
+    } else {
+      logger.debug(` No userId found for tag ${idTag}`);
+    }
+    
+    return userId || null;
+    
+  } catch (error) {
+    logger.error('Failed to resolve userId for tag', { idTag, error });
+    return null;
+  }
+}

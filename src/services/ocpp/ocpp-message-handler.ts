@@ -20,11 +20,10 @@ export function handleStatusNotification(
     [key: string]: any;
   }
 ): void {
-  //logger.debug(` StatusNotification: ${chargeBoxId}:${connectorId} → ${payload.status}`);
   logger.info(` handleStatusNotification called: ${chargeBoxId}:${connectorId} → ${payload.status}`);
 
   // 1. Update cache with new status (write-through)
-  const updatedState = chargerStateCache.updateFromOCPP(chargeBoxId, connectorId, {
+  chargerStateCache.updateFromOCPP(chargeBoxId, connectorId, {
     status: payload.status,
     errorCode: payload.errorCode,
     info: payload.info,
@@ -36,12 +35,7 @@ export function handleStatusNotification(
     chargeBoxId, 
     connectorId, 
     payload.status as ConnectorStatus,
-    {
-      errorCode: payload.errorCode as ConnectorErrorCode | undefined,
-      errorInfo: payload.info,
-      timestamp: payload.timestamp,
-      transactionId: updatedState.transactionId
-    }
+    payload.errorCode as ConnectorErrorCode | undefined  // ✅ Just the errorCode string
   );
   
   logger.info(` StatusNotification processed: ${chargeBoxId}:${connectorId} = ${payload.status}`);
@@ -62,26 +56,22 @@ export function handleStartTransaction(
     [key: string]: any;
   },
   transactionPk: number,
-  appUserId?: number  //  ADD: Optional userId if known at this point
+  appUserId?: number
 ): void {
-  logger.info(`🔌 StartTransaction: ${chargeBoxId}:${connectorId} tx=${transactionPk} tag=${payload.idTag}`);
+  logger.info(` StartTransaction: ${chargeBoxId}:${connectorId} tx=${transactionPk} tag=${payload.idTag}`);
   
   // Update cache to show Charging status + transaction info
-  chargerStateCache.set(chargeBoxId, connectorId, {
+  chargerStateCache.updateFromOCPP(chargeBoxId, connectorId, {
     status: 'Charging',
-    transactionId: transactionPk,
-    idTag: payload.idTag,
-    statusTimestamp: payload.timestamp
   });
   
   // Emit WebSocket event for new session
-  // ✅ FIX: Use appUserId if available, otherwise skip user-specific emit (reconciliation will handle)
   if (appUserId) {
     websocketEmitter.emitTransactionStarted(appUserId, {
-      transactionId: transactionPk,
+      transactionId: transactionPk,  //  REQUIRED
       chargeBoxId,
       connectorId,
-      idTag: payload.idTag,
+      idTag: payload.idTag,          //  Now valid (added to interface)
       startTime: payload.timestamp,
       meterStart: payload.meterStart
     });
@@ -104,28 +94,24 @@ export function handleStopTransaction(
     [key: string]: any;
   },
   transactionPk: number,
-  appUserId?: number  //  ADD: Optional userId if known
+  appUserId?: number
 ): void {
-  logger.info(`🔌 StopTransaction: ${chargeBoxId}:${connectorId} tx=${transactionPk} reason=${payload.reason || 'Unknown'}`);
+  logger.info(` StopTransaction: ${chargeBoxId}:${connectorId} tx=${transactionPk} reason=${payload.reason || 'Unknown'}`);
   
   // Update cache to show Available status (session ended)
-  chargerStateCache.set(chargeBoxId, connectorId, {
+  chargerStateCache.updateFromOCPP(chargeBoxId, connectorId, {
     status: 'Available',
-    transactionId: undefined,
-    idTag: undefined,
-    statusTimestamp: payload.timestamp
   });
   
   // Emit WebSocket event for session completion
-  // ✅ FIX: Use appUserId if available, otherwise skip (reconciliation will emit with resolved userId)
   if (appUserId) {
     websocketEmitter.emitTransactionCompleted(appUserId, {
-      transactionId: transactionPk,
+      transactionId: transactionPk,  //  REQUIRED
       chargeBoxId,
       connectorId,
       stopTime: payload.timestamp,
       stopReason: payload.reason,
-      meterStop: payload.meterStop
+      meterStop: payload.meterStop   //  Now valid (added to interface)
     });
   } else {
     logger.debug(` appUserId not available for transaction ${transactionPk}, skipping user emit (reconciliation will handle)`);

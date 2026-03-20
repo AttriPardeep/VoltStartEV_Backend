@@ -1,42 +1,42 @@
 // src/server.ts
 import 'dotenv/config';
 import express from 'express';
+import http from 'http'
 import { createServer } from 'http';
 import cors from 'cors';
 
 // Import routes
+import { webhooksRouter } from './routes/webhooks.routes.js';
+import { websocketEmitter, setChargingWebSocketService } from './services/websocket/emitter.service.js';
 import chargingRoutes from './routes/charging.routes.js';
 import chargersRoutes from './routes/chargers.routes.js';
 import authRoutes from './routes/auth.routes.js';
 import usersRoutes from './routes/users.routes.js';
 import telemetryRoutes from './routes/telemetry.routes.js';
 import healthRoutes from './routes/health.routes.js';
-
 // Import middleware
 import { errorHandler } from './middleware/error.middleware.js';
-
 // Import database
 import { checkDatabaseHealth, closeAllConnections } from './config/database.js';
-
 // Import WebSocket services
 import ChargingWebSocketService from './websocket/charging.websocket.js';
 import { setWebSocketService } from './services/polling/transaction-bridge.service.js';
-import { websocketEmitter } from './services/websocket/emitter.service.js';
-
 // Import reconciliation job
 import { startReconciliationJob } from './jobs/reconciliation.job.js';
+import { initializeWebSocketService } from './services/websocket/emitter.service.js';
 
 import logger from './config/logger.js';
-
 // Load environment variables
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 // Middleware
 app.use(cors({
   origin: process.env.CORS_ORIGIN?.split(',') || ['http://localhost:8081', 'http://localhost:3000'],
   credentials: true
 }));
+
+app.use('/api/webhooks/steve', express.raw({ type: '*/*', limit: '1mb' }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -55,7 +55,8 @@ app.use('/api/users', usersRoutes);
 app.use('/api/charging', chargingRoutes);
 app.use('/api/chargers', chargersRoutes);
 app.use('/api/telemetry', telemetryRoutes);
-app.use('/api', healthRoutes); 
+app.use('/api/webhooks', webhooksRouter);
+app.use('/', healthRoutes);
 
 // Error handling middleware (must be last)
 app.use(errorHandler);
@@ -63,25 +64,30 @@ app.use(errorHandler);
 // Create HTTP server FIRST
 const server = createServer(app);
 
+server.keepAliveTimeout = 4000;   // 5 seconds (shorter than SteVe's 5s read timeout)
+server.headersTimeout = 5000;     // Slightly longer than keepAliveTimeout
+server.requestTimeout = 8000;    // 10 seconds max for request processing
+//
 // Initialize WebSocket service AFTER server is created
 const wsService = new ChargingWebSocketService(server);
 
 // Register WebSocket service with polling bridge and emitter
+setChargingWebSocketService(wsService);
 setWebSocketService(wsService);
-websocketEmitter.registerWebSocketService(wsService);
 
 // Start reconciliation job
 startReconciliationJob();
-logger.info('📡 WebSocket services registered');
+logger.info(' WebSocket services registered');
 
 // Start server
-server.listen(PORT, async () => {
-  logger.info(`
+//server.listen(PORT, async () => {
+server.listen(PORT, '127.0.0.1', async () => { 
+logger.info(`
 ╔═══════════════════════════════════════════════════════════╗
 ║                                                           ║
-║   ⚡ VoltStartEV Backend Started                          ║
+║    VoltStartEV Backend Started                            ║
 ║                                                           ║
-║   Port: ${PORT}                                          ║
+║   Port: ${PORT}                                           ║
 ║   Environment: ${process.env.NODE_ENV || 'development'}                    ║
 ║   SteVe API: ${process.env.STEVE_API_URL || 'http://localhost:8080/steve'}      ║
 ║   WebSocket: ws://localhost:${PORT}/ws/charging              ║
@@ -107,21 +113,30 @@ server.listen(PORT, async () => {
   }
 });
 
-// Graceful shutdown handlers
+
+let isShuttingDown = false;  // Prevent duplicate shutdown
 async function gracefulShutdown(signal: string) {
+  if (isShuttingDown) {
+    logger.warn(` Already shutting down, ignoring ${signal}`);
+    return;
+  }
+  
+  isShuttingDown = true;
   logger.info(` ${signal} received. Shutting down gracefully...`);
   
   // Stop accepting new connections
   server.close(async () => {
-    logger.info('🔌 HTTP server closed');
+    logger.info(' HTTP server closed');
     
     // Close WebSocket connections
-    wsService.close();
-    logger.info('🔌 WebSocket connections closed');
+    if (wsService) {
+      wsService.close();
+      logger.info(' WebSocket connections closed');
+    }
     
-    // Close database connections
+    // Close database connections (ONLY ONCE)
     await closeAllConnections();
-    logger.info('🔌 Database connections closed');
+    logger.info(' Database connections closed');
     
     logger.info(' Shutdown complete');
     process.exit(0);
@@ -134,6 +149,7 @@ async function gracefulShutdown(signal: string) {
   }, 10000);
 }
 
+// Register handlers (ONLY in server.ts)
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 

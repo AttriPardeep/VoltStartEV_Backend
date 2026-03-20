@@ -185,6 +185,7 @@ router.get('/:chargeBoxId/connectors/:connectorId/status', async (req: Request, 
     const { chargeBoxId, connectorId } = req.params;
     const cid = parseInt(connectorId);
     
+    // Validate connectorId
     if (isNaN(cid)) {
       return res.status(400).json({
         success: false,
@@ -195,20 +196,28 @@ router.get('/:chargeBoxId/connectors/:connectorId/status', async (req: Request, 
     }
     
     // 1. Try cache first (read-through pattern)
-    const cached = chargerStateCache.get(chargeBoxId, cid);
+    const cached = await chargerStateCache.get(chargeBoxId, cid);
+    
     if (cached) {
-      // Return only public fields (hide cache internals)
-      const { cachedAt, ttlMs, ...publicData } = cached;
+      // Cache hit - return cached status
       return res.status(200).json({
         success: true,
-        data: publicData,
+        data: {
+          chargeBoxId,
+          connectorId: cid,
+          status: cached.status,
+	  fromCache: true,
+          errorCode: cached.errorCode,
+          errorInfo: cached.errorInfo,
+          statusTimestamp: cached.timestamp
+        },
         fromCache: true,
         timestamp: new Date().toISOString()
       });
     }
     
     // 2. Cache miss → fetch from SteVe DB
-    logger.debug(` Cache miss: ${chargeBoxId}:${cid}, fetching connector status from DB`);
+    logger.debug(`Cache miss: ${chargeBoxId}:${cid}, fetching connector status from DB`);
     
     // Query connector_status table for specific connector
     const [connectorStatus] = await steveQuery(`
@@ -249,17 +258,14 @@ router.get('/:chargeBoxId/connectors/:connectorId/status', async (req: Request, 
     `, [chargeBoxId, cid]);
     
     // 3. Update cache with fetched data
-    chargerStateCache.set(chargeBoxId, cid, {
+    chargerStateCache.updateFromOCPP(chargeBoxId, cid, {
       status: connectorStatus.status,
       errorCode: connectorStatus.error_code,
-      errorInfo: connectorStatus.error_info,
-      statusTimestamp: connectorStatus.status_timestamp,
-      lastHeartbeat: connectorStatus.last_heartbeat_timestamp,
-      transactionId: activeTx?.transaction_pk,
-      idTag: activeTx?.id_tag
+      info: connectorStatus.error_info,
+      timestamp: connectorStatus.status_timestamp
     });
     
-    // 4. Return response (exclude cache internals)
+    // 4. Return response
     res.status(200).json({
       success: true,
       data: {

@@ -10,7 +10,7 @@ let wsService: any = null;
 
 export function setWebSocketService(service: any) {
   wsService = service;
-  logger.info('📡 WebSocket service registered with polling bridge');
+  logger.info(' WebSocket service registered with polling bridge');
 }
 
 // ─────────────────────────────────────────────────────

@@ -40,6 +40,20 @@ export interface SteVeApiResponse<T> {
   };
 }
 
+export interface RemoteStartParams {
+  chargeBoxId: string;
+  connectorId: number;
+  idTag: string;
+}
+
+export interface RemoteStopParams {
+  chargeBoxId: string;
+  transactionId: number;
+}
+
+const STEVE_API_USER = process.env.STEVE_API_USER || 'voltstart_backend';
+const STEVE_API_PASS = process.env.STEVE_API_PASS || 'VoltStartAPI2026!';
+
 /**
  * Service for calling SteVe REST API endpoints
  * Handles authentication, retries, and error translation
@@ -48,13 +62,14 @@ export class SteVeApiService {
   private config: SteVeApiConfig;
   private baseUrl: string;
   private authHeader: string;
-
+  private readonly apiUser: string;
+  private readonly apiPassword: string;
   constructor(config: SteVeApiConfig) {
     this.config = config;
     this.baseUrl = config.baseUrl.replace(/\/$/, ''); // Remove trailing slash
-    this.authHeader = `Basic ${Buffer.from(
-      `${config.username}:${config.password}`
-    ).toString('base64')}`;
+    this.apiUser = STEVE_API_USER;
+    this.apiPassword = STEVE_API_PASS;
+    this.authHeader = `Basic ${Buffer.from(`${STEVE_API_USER}:${STEVE_API_PASS}`).toString('base64')}`;
   }
 
   private async fetch<T>(
@@ -91,7 +106,7 @@ export class SteVeApiService {
       }
 
       if (!response.ok) {
-        logger.warn(`⚠️ SteVe API error ${response.status}`, {
+        logger.warn(` SteVe API error ${response.status}`, {
           endpoint,
           method: options.method,
           response: data,
@@ -109,7 +124,7 @@ export class SteVeApiService {
 
       return { success: true, data: data as T };
     } catch (error: any) {
-      logger.error('💥 SteVe API request failed', {
+      logger.error(' SteVe API request failed', {
         endpoint,
         error: error.message,
         code: error.code,
@@ -135,7 +150,7 @@ export class SteVeApiService {
    * POST /api/v1/ocppTags
    */
   async createTag(tag: OcppTagForm): Promise<SteVeApiResponse<OcppTagOverview>> {
-    logger.debug(`🏷️ Creating OCPP tag via API: ${tag.idTag}`);
+    logger.debug(` Creating OCPP tag via API: ${tag.idTag}`);
 
     return await this.fetch<OcppTagOverview>('/api/v1/ocppTags', {
       method: 'POST',
@@ -151,7 +166,7 @@ export class SteVeApiService {
     ocppTagPk: number,
     tag: OcppTagForm
   ): Promise<SteVeApiResponse<OcppTagOverview>> {
-    logger.debug(`🏷️ Updating OCPP tag via API: ${ocppTagPk}`);
+    logger.debug(` Updating OCPP tag via API: ${ocppTagPk}`);
 
     return await this.fetch<OcppTagOverview>(`/api/v1/ocppTags/${ocppTagPk}`, {
       method: 'PUT',
@@ -166,7 +181,7 @@ export class SteVeApiService {
   async getTagByIdTag(
     idTag: string
   ): Promise<SteVeApiResponse<OcppTagOverview[]>> {
-    logger.debug(`🔍 Fetching OCPP tag via API: ${idTag}`);
+    logger.debug(` Fetching OCPP tag via API: ${idTag}`);
 
     return await this.fetch<OcppTagOverview[]>(
       `/api/v1/ocppTags?idTag=${encodeURIComponent(idTag)}`
@@ -180,7 +195,7 @@ export class SteVeApiService {
   async getTagByPk(
     ocppTagPk: number
   ): Promise<SteVeApiResponse<OcppTagOverview>> {
-    logger.debug(`🔍 Fetching OCPP tag by PK via API: ${ocppTagPk}`);
+    logger.debug(` Fetching OCPP tag by PK via API: ${ocppTagPk}`);
 
     return await this.fetch<OcppTagOverview>(`/api/v1/ocppTags/${ocppTagPk}`);
   }
@@ -192,7 +207,7 @@ export class SteVeApiService {
   async deleteTag(
     ocppTagPk: number
   ): Promise<SteVeApiResponse<OcppTagOverview>> {
-    logger.debug(`🗑️ Deleting OCPP tag via API: ${ocppTagPk}`);
+    logger.debug(` Deleting OCPP tag via API: ${ocppTagPk}`);
 
     return await this.fetch<OcppTagOverview>(`/api/v1/ocppTags/${ocppTagPk}`, {
       method: 'DELETE',
@@ -256,6 +271,72 @@ export class SteVeApiService {
     const result = await this.getTagByIdTag(idTag);
     return result.success && Array.isArray(result.data) && result.data.length > 0;
   }
+
+
+  async remoteStartTransaction(params: RemoteStartParams): Promise<SteVeApiResponse<any>> {
+    try {
+      const response = await fetch(`${this.baseUrl}/api/v1/operations/RemoteStartTransaction`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Basic ${Buffer.from(`${this.apiUser}:${this.apiPassword}`).toString('base64')}`
+        },
+        body: JSON.stringify({
+          chargeBoxIdList: [params.chargeBoxId],
+          connectorId: params.connectorId,
+          idTag: params.idTag
+        })
+      });
+  
+      const data: any = await response.json();
+      
+      if (!response.ok) {
+        return {
+          success: false,
+          error: { message: (data as any).message || 'SteVe API error', status: response.status }
+        };
+      }
+      
+      return { success: true, data };
+      
+    } catch (error: any) {
+      logger.error(' RemoteStart API call failed', { params, error: error.message });
+      return {
+        success: false,
+        error: { message: `Network error: ${error.message}`, status: 0 }
+      };
+    }
+  }
+  
+  async remoteStopTransaction(params: RemoteStopParams): Promise<SteVeApiResponse<any>> {
+    try {
+      const response = await fetch(`${this.baseUrl}/api/v1/operations/RemoteStopTransaction`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Basic ${Buffer.from(`${this.apiUser}:${this.apiPassword}`).toString('base64')}`
+        },
+        body: JSON.stringify({
+          chargeBoxIdList: [params.chargeBoxId],
+          transactionId: params.transactionId
+        })
+      });
+      const data: any = await response.json();
+      if (!response.ok) {
+        return {
+          success: false,
+          error: { message: (data as any).message || 'SteVe API error', status: response.status }
+        };
+      }
+      return { success: true, data };
+    } catch (error: any) {
+      logger.error(' RemoteStop API call failed', { params, error: error.message });
+      return {
+        success: false,
+        error: { message: `Network error: ${error.message}`, status: 0 }
+      };
+    }
+  }  
 }
 
 // ─────────────────────────────────────────────────────
@@ -264,7 +345,7 @@ export class SteVeApiService {
 
 export const steveApiService = new SteVeApiService({
   baseUrl: process.env.STEVE_API_URL || 'http://localhost:8080/steve',
-  username: process.env.STEVE_API_USER || 'voltstart_backend',
-  password: process.env.STEVE_API_PASS || '',
+  username: STEVE_API_USER,
+  password: STEVE_API_PASS,
   timeoutMs: parseInt(process.env.STEVE_API_TIMEOUT_MS || '30000'),
 });

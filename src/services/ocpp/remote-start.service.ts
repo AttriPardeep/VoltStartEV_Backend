@@ -2,7 +2,7 @@
 import { steveQuery } from '../../config/database.js';
 import logger from '../../config/logger.js';
 
-// ✅ ADD: chargingProfilePk as optional field (per api-docs.json RemoteStartTransactionParams)
+//  ADD: chargingProfilePk as optional field (per api-docs.json RemoteStartTransactionParams)
 export interface RemoteStartRequest {
   chargeBoxId: string;
   connectorId: number;
@@ -12,7 +12,7 @@ export interface RemoteStartRequest {
 }
 
 // Service account credentials (loaded from env vars)
-const STEVE_API_USER = process.env.STEVE_API_USER || 'voltstart_backend';
+const STEVE_API_USER = process.env.STEVE_API_USER;
 const STEVE_API_PASS = process.env.STEVE_API_PASS || 'ServiceSecretKey_2026!';
 
 function getServiceAuthHeader(): Record<string, string> {
@@ -31,7 +31,7 @@ export async function startChargingSession(req: RemoteStartRequest): Promise<{ t
   const steveApiEndpoint = `${steveApiBaseUrl}/api/v1/operations/RemoteStartTransaction`;
   
   try {
-    // ✅ Build request body per api-docs.json RemoteStartTransactionParams
+    //  Build request body per api-docs.json RemoteStartTransactionParams
     // Required fields only: chargeBoxIdList (array with 1 element), idTag
     const requestBody: any = {
       chargeBoxIdList: [req.chargeBoxId],  // Required: array with exactly 1 element
@@ -43,7 +43,7 @@ export async function startChargingSession(req: RemoteStartRequest): Promise<{ t
       requestBody.connectorId = req.connectorId;
     }
     
-    // ✅ Only include chargingProfilePk if it's a valid PK (> 0)
+    //  Only include chargingProfilePk if it's a valid PK (> 0)
     // Sending 0 causes "Bad Request" because profile ID 0 doesn't exist
     if (req.chargingProfilePk && req.chargingProfilePk > 0) {
       requestBody.chargingProfilePk = req.chargingProfilePk;
@@ -93,7 +93,7 @@ export async function startChargingSession(req: RemoteStartRequest): Promise<{ t
     // Handle success
     if (result.successResponses?.length) {
       const success = result.successResponses[0];
-      logger.info(`✅ RemoteStart via SteVe REST API succeeded`, { 
+      logger.info(` RemoteStart via SteVe REST API succeeded`, { 
         chargeBoxId: success.chargeBoxId, 
         response: success.response,
         appUserId: req.userId,

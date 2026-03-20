@@ -20,5 +20,5 @@
     }
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "**/*.test.ts", "tests/**/*"]
+  "exclude": ["node_modules", "dist", "**/*.test.ts", "tests/**/*", "src/routes/webhooks.routes.ts","src/types/steve-events.ts","steve-event-handler.ts"]
 }
