@@ -52,7 +52,21 @@ router.post('/start', authenticateJwt, async (req: Request, res: Response) => {
         timestamp: new Date().toISOString()
       });
     }
+
+    const activeSession = await appDbQuery(
+      `SELECT session_id FROM charging_sessions 
+       WHERE app_user_id = ? AND status = 'active' LIMIT 1`,
+      [appUserId]
+    );
     
+    if (activeSession.length > 0) {
+      return res.status(409).json({
+        success: false,
+        error: 'You already have an active charging session',
+        sessionId: activeSession[0].session_id
+      });
+    }
+
     // Call SteVe RemoteStart API
     const startResult = await steveApiService.remoteStartTransaction({
       chargeBoxId,
@@ -69,7 +83,7 @@ router.post('/start', authenticateJwt, async (req: Request, res: Response) => {
       });
     }
     
-    logger.info(`✅ Starting charging session for ${chargeBoxId}:${connectorId}`, {
+    logger.info(` Starting charging session for ${chargeBoxId}:${connectorId}`, {
       appUserId,
       idTag
     });
@@ -101,7 +115,16 @@ router.post('/start', authenticateJwt, async (req: Request, res: Response) => {
 router.post('/stop', authenticateJwt, async (req: Request, res: Response) => {
   try {
     const { chargeBoxId, transactionId } = req.body;
-    
+    const appUserId = (req as any).user?.id;
+    if (!appUserId) {
+      return res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'User authentication required',
+        timestamp: new Date().toISOString()
+      });
+    }
+
     // Validate required fields
     if (!chargeBoxId || !transactionId) {
       return res.status(400).json({
@@ -111,7 +134,40 @@ router.post('/stop', authenticateJwt, async (req: Request, res: Response) => {
         timestamp: new Date().toISOString()
       });
     }
+    const sessions = await appDbQuery(
+      `SELECT session_id, status, steve_transaction_pk, app_user_id 
+       FROM charging_sessions 
+       WHERE steve_transaction_pk = ? LIMIT 1`,
+      [transactionId]
+    );
     
+    const session = sessions[0];
+    
+    // Guard 1: transaction doesn't exist at all
+    if (!session) {
+      return res.status(404).json({
+        success: false,
+        error: 'Transaction not found'
+      });
+    }
+    
+    // Guard 2: already stopped — idempotent response, not an error
+    if (session.status === 'completed') {
+      return res.status(200).json({
+        success: true,
+        message: 'Session already stopped',
+        alreadyStopped: true
+      });
+    }
+    
+    // Guard 3: belongs to a different user
+    if (Number(session.app_user_id) !== Number(appUserId)) {  
+      return res.status(403).json({
+        success: false,
+        error: 'Not authorized to stop this session'
+      });
+    }
+
     // Check if transaction already stopped (idempotent)
     const existingStops = await steveQuery(
       'SELECT 1 FROM transaction_stop WHERE transaction_pk = ? LIMIT 1',
@@ -276,47 +332,79 @@ router.get('/session/active', authenticateJwt, async (req: Request, res: Respons
 });
 
 // GET /api/charging/sessions - Get session history for user
+// GET /api/charging/sessions - Get session history for user
 router.get('/sessions', authenticateJwt, async (req: Request, res: Response) => {
   try {
-    const appUserId = (req as any).user?.id;
-    const limit = parseInt(req.query.limit as string) || 20;
-    
-    // Query voltstartev_db.charging_sessions (CORRECT COLUMN NAMES)
-    const sessions = await appDbQuery(`
-      SELECT 
-        session_id,
-        charge_box_id,
-        connector_id,
-        id_tag,
-        start_time,
-        end_time,
-        duration_seconds,
-        energy_kwh,
-        total_cost,
-        status,
-        payment_status,
-        created_at
+    const rawUserId = (req as any).user?.id;
+    const appUserId = Number(rawUserId);
+
+    if (!Number.isInteger(appUserId) || appUserId <= 0) {
+      return res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'Invalid user context',
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    let limit = 20;
+    const limitParam = req.query.limit;
+
+    if (typeof limitParam === 'string') {
+      const parsed = parseInt(limitParam, 10);
+      if (!isNaN(parsed) && parsed > 0 && parsed <= 100) {
+        limit = parsed;
+      }
+    }
+
+    const sessions = await appDbQuery(
+      `SELECT 
+  session_id,
+  charge_box_id,
+  connector_id,
+  id_tag,
+  start_time,
+  end_time,
+  duration_seconds,
+  energy_kwh,
+  total_cost,
+  status,
+  stop_reason,
+  payment_status,
+  created_at 
       FROM charging_sessions
       WHERE app_user_id = ?
       ORDER BY start_time DESC
-      LIMIT ?
-    `, [appUserId, limit]);
-    
+      LIMIT ${limit}`,
+      [appUserId]
+    );
+
+    logger.info('Charging sessions fetched', {
+      userId: appUserId,
+      count: Array.isArray(sessions) ? sessions.length : 0,
+      limit
+    });
+
     res.status(200).json({
       success: true,
       data: sessions,
       timestamp: new Date().toISOString()
     });
-    
+
   } catch (error: any) {
-    logger.error(' Failed to fetch session history', { error });
+    logger.error('Failed to fetch session history', { 
+      error: error.message,
+      sqlState: error.sqlState,
+      userId: (req as any).user?.id,
+      limit: req.query.limit
+    });
+
     res.status(500).json({
       success: false,
       error: 'Internal server error',
-      message: error.message || 'Unable to retrieve charging sessions',
+      message: 'Unable to retrieve charging sessions',
       timestamp: new Date().toISOString()
     });
   }
 });
-
 export default router;

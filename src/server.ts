@@ -24,6 +24,10 @@ import { setWebSocketService } from './services/polling/transaction-bridge.servi
 // Import reconciliation job
 import { startReconciliationJob } from './jobs/reconciliation.job.js';
 import { initializeWebSocketService } from './services/websocket/emitter.service.js';
+import { startReportsJob } from './jobs/reconciliation.job.js';
+import { verifySmtpConnection } from './services/email/email.service.js';
+// AI Assistance 
+import assistantRoutes from './routes/assistant.routes.js';
 
 import logger from './config/logger.js';
 // Load environment variables
@@ -32,7 +36,7 @@ const PORT = Number(process.env.PORT) || 3000;
 
 // Middleware
 app.use(cors({
-  origin: process.env.CORS_ORIGIN?.split(',') || ['http://localhost:8081', 'http://localhost:3000'],
+  origin: process.env.CORS_ORIGIN?.split(',') || ['http://localhost:8081', 'http://localhost:3000', 'http://136.113.7.146:3000'],
   credentials: true
 }));
 
@@ -57,6 +61,8 @@ app.use('/api/chargers', chargersRoutes);
 app.use('/api/telemetry', telemetryRoutes);
 app.use('/api/webhooks', webhooksRouter);
 app.use('/', healthRoutes);
+// AI Assistance 
+app.use('/api/assistant', assistantRoutes);
 
 // Error handling middleware (must be last)
 app.use(errorHandler);
@@ -64,9 +70,9 @@ app.use(errorHandler);
 // Create HTTP server FIRST
 const server = createServer(app);
 
-server.keepAliveTimeout = 4000;   // 5 seconds (shorter than SteVe's 5s read timeout)
-server.headersTimeout = 5000;     // Slightly longer than keepAliveTimeout
-server.requestTimeout = 8000;    // 10 seconds max for request processing
+server.keepAliveTimeout = 61000;   // 5 seconds (shorter than SteVe's 5s read timeout)
+server.headersTimeout = 62000;     // Slightly longer than keepAliveTimeout
+server.requestTimeout = 30000;    // 10 seconds max for request processing
 //
 // Initialize WebSocket service AFTER server is created
 const wsService = new ChargingWebSocketService(server);
@@ -77,11 +83,12 @@ setWebSocketService(wsService);
 
 // Start reconciliation job
 startReconciliationJob();
+startReportsJob();
 logger.info(' WebSocket services registered');
 
 // Start server
 //server.listen(PORT, async () => {
-server.listen(PORT, '127.0.0.1', async () => { 
+server.listen(PORT, '0.0.0.0', async () => { 
 logger.info(`
 ╔═══════════════════════════════════════════════════════════╗
 ║                                                           ║
@@ -113,6 +120,12 @@ logger.info(`
   }
 });
 
+// Inside server.listen callback:
+const smtpOk = await verifySmtpConnection();
+if (!smtpOk) {
+  logger.warn(' SMTP not available — email features disabled');
+  // Don't exit — app works without email
+}
 
 let isShuttingDown = false;  // Prevent duplicate shutdown
 async function gracefulShutdown(signal: string) {

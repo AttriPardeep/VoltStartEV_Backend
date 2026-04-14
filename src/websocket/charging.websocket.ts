@@ -154,7 +154,7 @@ export class ChargingWebSocketService {
       ws.close(4002, 'Invalid token');
     }
   }
-
+/*
   private extractToken(request: IncomingMessage): string | null {
     const authHeader = request.headers['authorization'];
     if (authHeader && authHeader.startsWith('Bearer ')) {
@@ -162,7 +162,21 @@ export class ChargingWebSocketService {
     }
     return null;
   }
+*/
+private extractToken(request: IncomingMessage): string | null {
+  // 1. Check Authorization header first
+  const authHeader = request.headers['authorization'];
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    return authHeader.substring(7);
+  }
 
+  // 2. Check query param (for WebSocket connections from mobile)
+  const url = new URL(request.url || '', 'http://localhost');
+  const queryToken = url.searchParams.get('token');
+  if (queryToken) return queryToken;
+
+  return null;
+}
   private handleClientMessage(clientId: string, message: string) {
     try {
       const data = JSON.parse(message);

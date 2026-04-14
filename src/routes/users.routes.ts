@@ -8,6 +8,7 @@ import { steveApiService } from '../services/steve/steve-api.service.js';
 import { authenticateJwt } from '../middleware/auth.middleware.js';
 import validator from 'validator';
 import { resolveUserIdForTag, validateTagForUser, getUserTags, getTagAssignment } from '../services/auth/tag-resolver.service.js';
+import { generateMonthlyReport } from '../services/reports/monthly.service.js';
 import logger from '../config/logger.js';
 
 const router = Router();
@@ -164,6 +165,17 @@ router.post('/login', async (req: Request, res: Response) => {
         message: 'Invalid credentials'
       });
     }
+    // Get user's primary OCPP tag
+    const tags = await steveQuery<any>(`
+      SELECT ot.id_tag
+      FROM stevedb.user_ocpp_tag uot
+      JOIN stevedb.ocpp_tag ot ON ot.ocpp_tag_pk = uot.ocpp_tag_pk
+      WHERE uot.user_pk = ?
+      AND ot.id_tag != 'NONEXISTENT'
+      ORDER BY uot.ocpp_tag_pk ASC
+      LIMIT 1
+    `, [user.user_id]);
+    const idTag = tags[0]?.id_tag || null;
 
     // Generate JWT token
     const jwtSecret = process.env.JWT_SECRET;
@@ -189,9 +201,14 @@ router.post('/login', async (req: Request, res: Response) => {
           username: user.username,
           email: user.email,
           firstName: user.first_name,
-          lastName: user.last_name
+          lastName: user.last_name,
+          idTag,                                          
+          vehicleModel: user.vehicle_model || null,        
+          batteryCapacityKwh: user.battery_capacity_kwh 
+            ? parseFloat(user.battery_capacity_kwh) : null, 
+          targetSocPercent: user.target_soc_percent || 80,  
         }
-      }
+      }      
     });
     
   } catch (error) {
@@ -547,4 +564,139 @@ router.get('/tags', authenticateJwt, async (req: Request, res: Response) => {
   }
 });
 
+// PUT /api/users/me/push-token
+router.put('/me/push-token', authenticateJwt, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).user.id;
+    const { token, platform } = req.body;
+    
+    await appDbExecute(
+      'UPDATE users SET push_token = ?, push_platform = ? WHERE user_id = ?',
+      [token, platform, userId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false });
+  }
+});
+
+//  PUT /api/users/me/vehicle - MUST be BEFORE export default router
+router.put('/me/vehicle', authenticateJwt, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).user.id;
+    const { vehicleModel, batteryCapacityKwh, targetSocPercent } = req.body;
+    
+    await appDbExecute(`
+      UPDATE users 
+      SET vehicle_model = ?,
+          battery_capacity_kwh = ?,
+          target_soc_percent = ?,
+          updated_at = NOW()
+      WHERE user_id = ?
+    `, [
+      vehicleModel || null, 
+      batteryCapacityKwh || null, 
+      targetSocPercent || 80, 
+      userId
+    ]);
+
+    logger.info(` Vehicle profile updated for user ${userId}`);
+    
+    res.json({ 
+      success: true, 
+      message: 'Vehicle profile updated',
+      data: { vehicleModel, batteryCapacityKwh, targetSocPercent }
+    });
+  } catch (error: any) {
+    logger.error(' Failed to update vehicle profile', { error });
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to update vehicle profile',
+      message: error.message 
+    });
+  }
+});
+
+router.get('/me/report/:year/:month', authenticateJwt,
+  async (req: Request, res: Response) => {
+    const userId = (req as any).user.id;
+    const year = parseInt(req.params.year);
+    const month = parseInt(req.params.month);
+
+    const report = await generateMonthlyReport(userId, year, month);
+    res.json({ success: true, data: report });
+  }
+);
+
+
+// GET /api/users/me/vehicles — list all vehicles
+router.get('/me/vehicles', authenticateJwt, async (req: Request, res: Response) => {
+  const userId = (req as any).user.id;
+  const vehicles = await appDbQuery(
+    'SELECT * FROM user_vehicles WHERE user_id = ? ORDER BY is_primary DESC, created_at ASC',
+    [userId]
+  );
+  res.json({ success: true, data: vehicles });
+});
+
+// POST /api/users/me/vehicles — add vehicle
+router.post('/me/vehicles', authenticateJwt, async (req: Request, res: Response) => {
+  const userId = (req as any).user.id;
+  const { nickname, brand, model, variant, batteryKwh, targetSoc, isPrimary } = req.body;
+  if (!brand || !model || !batteryKwh) {
+    return res.status(400).json({ success: false, error: 'brand, model and batteryKwh required' });
+  }
+  // If setting as primary, unset others first
+  if (isPrimary) {
+    await appDbExecute('UPDATE user_vehicles SET is_primary = 0 WHERE user_id = ?', [userId]);
+  }
+  const result = await appDbExecute(
+    `INSERT INTO user_vehicles (user_id, nickname, brand, model, variant, battery_kwh, target_soc, is_primary)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [userId, nickname || null, brand, model, variant || null,
+     batteryKwh, targetSoc || 80, isPrimary ? 1 : 0]
+  );
+  res.json({ success: true, data: { id: result.insertId } });
+});
+
+// PUT /api/users/me/vehicles/:id — update vehicle
+router.put('/me/vehicles/:id', authenticateJwt, async (req: Request, res: Response) => {
+  const userId = (req as any).user.id;
+  const { nickname, brand, model, variant, batteryKwh, targetSoc, isPrimary } = req.body;
+  if (isPrimary) {
+    await appDbExecute('UPDATE user_vehicles SET is_primary = 0 WHERE user_id = ?', [userId]);
+  }
+  await appDbExecute(
+    `UPDATE user_vehicles SET nickname=?, brand=?, model=?, variant=?,
+     battery_kwh=?, target_soc=?, is_primary=? WHERE id=? AND user_id=?`,
+    [nickname || null, brand, model, variant || null,
+     batteryKwh, targetSoc || 80, isPrimary ? 1 : 0,
+     req.params.id, userId]
+  );
+  res.json({ success: true });
+});
+
+// DELETE /api/users/me/vehicles/:id — remove vehicle
+router.delete('/me/vehicles/:id', authenticateJwt, async (req: Request, res: Response) => {
+  const userId = (req as any).user.id;
+  await appDbExecute(
+    'DELETE FROM user_vehicles WHERE id = ? AND user_id = ?',
+    [req.params.id, userId]
+  );
+  res.json({ success: true });
+});
+
+// PUT /api/users/me/vehicles/:id/primary — set as primary
+router.put('/me/vehicles/:id/primary', authenticateJwt, async (req: Request, res: Response) => {
+  const userId = (req as any).user.id;
+  await appDbExecute('UPDATE user_vehicles SET is_primary = 0 WHERE user_id = ?', [userId]);
+  await appDbExecute(
+    'UPDATE user_vehicles SET is_primary = 1 WHERE id = ? AND user_id = ?',
+    [req.params.id, userId]
+  );
+  res.json({ success: true });
+});
+
+// export default router MUST BE LAST
 export default router;
+

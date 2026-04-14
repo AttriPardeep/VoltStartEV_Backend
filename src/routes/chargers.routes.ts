@@ -2,10 +2,11 @@
 import { steveQuery } from '../config/database.js';
 import { Router, Request, Response } from 'express';
 import { authenticateJwt } from '../middleware/auth.middleware.js';
-// ✅ FIX: Remove duplicate import - keep only one getChargerStatus
 import { getAllChargers, getChargerStatus, getConnectorMetrics } from '../services/ocpp/steve-adapter.js';
 import { chargerStateCache } from '../cache/chargerState.js';
 import { JwtPayload } from '../middleware/auth.middleware.js';
+import { getAllChargerPricing, formatRateDisplay } from '../services/billing/pricing.service.js';
+import { estimateSessionCost } from '../services/billing/pricing.service.js';
 
 import logger from '../config/logger.js';
 
@@ -14,13 +15,13 @@ const router = Router();
 console.log(' chargers.routes.ts: Loading routes with simplified status model...');
 
 // ─────────────────────────────────────────────────────
-// ⚠️ CRITICAL: Register MORE SPECIFIC routes BEFORE less specific ones
+// CRITICAL: Register MORE SPECIFIC routes BEFORE less specific ones
 // Express matches routes in registration order!
 // ─────────────────────────────────────────────────────
 
 // MUST be registered BEFORE /:id to avoid route collision
 router.get('/:id/metrics', async (req: Request, res: Response) => {
-  console.log(`📊 GET /api/chargers/${req.params.id}/metrics connectorId=${req.query.connectorId}`);
+  console.log(` GET /api/chargers/${req.params.id}/metrics connectorId=${req.query.connectorId}`);
   
   const { connectorId } = req.query;
   
@@ -46,7 +47,7 @@ router.get('/:id/metrics', async (req: Request, res: Response) => {
   try {
     const metrics = await getConnectorMetrics(req.params.id, connectorIdNum);
     
-    console.log(`✅ Metrics found: ${metrics.length} records for ${req.params.id}`);
+    console.log(` Metrics found: ${metrics.length} records for ${req.params.id}`);
     
     // Return OCPP 1.6 compliant MeterValues structure
     res.status(200).json({
@@ -83,7 +84,7 @@ router.get('/:id/metrics', async (req: Request, res: Response) => {
 
 //  GET /api/chargers/:id - Get SIMPLIFIED charger status (user-facing)
 router.get('/:id', async (req: Request, res: Response) => {
-  console.log(`📡 GET /api/chargers/${req.params.id} (simplified status)`);
+  console.log(` GET /api/chargers/${req.params.id} (simplified status)`);
   
   try {
     const { id: chargeBoxId } = req.params;
@@ -143,57 +144,87 @@ router.get('/:id', async (req: Request, res: Response) => {
 
 //  GET /api/chargers - List all chargers with simplified status
 router.get('/', async (_req: Request, res: Response) => {
-  console.log(' GET /api/chargers (list with simplified status)');
-  
   try {
-    const chargers = await getAllChargers();
-    
+    const [chargers, pricingMap] = await Promise.all([
+      getAllChargers(),
+      getAllChargerPricing(),
+    ]);
+
     res.status(200).json({
       success: true,
-      message: 'Chargers retrieved successfully',
-      data: chargers.map(c => ({
-        chargeBoxId: c.chargeBoxId,
-        status: c.status,
-        ...(c.availableConnectors !== undefined && {
+      data: chargers.map(c => {
+        const pricing = pricingMap[c.chargeBoxId];
+        return {
+          chargeBoxId: c.chargeBoxId,
+          status: c.status,
           availableConnectors: c.availableConnectors,
-          totalConnectors: c.totalConnectors
-        }),
-        ...(c.estimatedWait && { estimatedWaitMinutes: c.estimatedWait }),
-        name: c.name,
-        location: c.location,
-        powerType: c.capabilities?.powerType,
-        maxPower: c.capabilities?.maxPower
-      })),
+          totalConnectors: c.totalConnectors,
+	  connectorStatuses: c.connectorStatuses,
+          name: c.name,
+          description: c.description,
+          street: c.street,
+          city: c.city,
+          latitude: c.latitude,
+          longitude: c.longitude,
+          distance: c.distance,
+          powerType: c.capabilities?.powerType,
+          maxPower: c.capabilities?.maxPower,
+          // New pricing fields
+          pricing: pricing ? {
+            model: pricing.pricingModel,
+            ratePerKwh: pricing.ratePerKwh,
+            ratePerMinute: pricing.ratePerMinute,
+            sessionFee: pricing.sessionFee,
+            displayName: pricing.displayName,
+            rateDisplay: formatRateDisplay(pricing),
+            tiers: pricing.tiers,
+          } : null,
+        };
+      }),
       timestamp: new Date().toISOString()
     });
   } catch (error) {
-    logger.error('Failed to list chargers', { error });
-    res.status(500).json({
-      success: false,
-      error: 'Internal server error',
-      message: error instanceof Error ? error.message : 'Unknown error',
-      timestamp: new Date().toISOString()
-    });
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
+// GET /api/chargers/:id/pricing-estimate
+router.get('/:id/pricing-estimate', authenticateJwt, async (req, res) => {
+  try {
+    const { id: chargeBoxId } = req.params;
+    const {
+      connectorId, batteryKwh, currentSoc, targetSoc, maxPowerKw
+    } = req.query;
+
+    const estimate = await estimateSessionCost(
+      chargeBoxId,
+      parseInt(connectorId as string) || 1,
+      batteryKwh ? parseFloat(batteryKwh as string) : undefined,
+      currentSoc ? parseFloat(currentSoc as string) : undefined,
+      targetSoc ? parseFloat(targetSoc as string) : undefined,
+      maxPowerKw ? parseFloat(maxPowerKw as string) : undefined,
+    );
+
+    res.json({ success: true, data: estimate });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
 
 // In the connector status route handler:
-
 router.get('/:chargeBoxId/connectors/:connectorId/status', async (req: Request, res: Response) => {
   try {
     const { chargeBoxId, connectorId } = req.params;
     const cid = parseInt(connectorId);
-    
-    // Validate connectorId
-    if (isNaN(cid)) {
+
+    if (isNaN(cid) || cid <= 0) {
       return res.status(400).json({
         success: false,
         error: 'Bad request',
-        message: 'connectorId must be a valid number',
+        message: `Invalid connectorId: ${connectorId}. Connector IDs must be 1 or higher (0 represents the charger itself, not a physical port).`,
         timestamp: new Date().toISOString()
       });
-    }
+    }    
     
     // 1. Try cache first (read-through pattern)
     const cached = await chargerStateCache.get(chargeBoxId, cid);
@@ -218,7 +249,6 @@ router.get('/:chargeBoxId/connectors/:connectorId/status', async (req: Request, 
     
     // 2. Cache miss → fetch from SteVe DB
     logger.debug(`Cache miss: ${chargeBoxId}:${cid}, fetching connector status from DB`);
-    
     // Query connector_status table for specific connector
     const [connectorStatus] = await steveQuery(`
       SELECT 

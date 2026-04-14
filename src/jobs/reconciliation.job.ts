@@ -1,6 +1,7 @@
 // src/jobs/reconciliation.job.ts
 import cron from 'node-cron';
 import { reconciliationService } from '../services/reconciliation/reconciliation.service.js';
+import { sendMonthlyReportsToAllUsers } from '../services/reports/monthly.service.js';
 import logger from '../config/logger.js';
 
 export function startReconciliationJob() {
@@ -19,8 +20,7 @@ export function startReconciliationJob() {
         lookbackMinutes: lookbackMinutes 
       });
       
-      logger.info(` Reconciliation stats`, { stats });
-      
+      logger.info(`Reconciliation complete: checked=${stats.checked}, created=${stats.created}, updated=${stats.updated}, errors=${stats.errors}, duration=${stats.durationMs}ms`); 
     } catch (error: any) {
       logger.error(' Reconciliation job failed', { error: error.message });
     }
@@ -35,4 +35,12 @@ export function startReconciliationJob() {
       logger.error(' Initial reconciliation failed', { error: error.message });
     }
   }, 30000); // Wait 30 seconds after startup
+}
+
+export function startReportsJob() {
+  // Run at 9 AM on 1st of every month
+  cron.schedule('0 9 1 * *', async () => {
+    logger.info('Running monthly reports job');
+    await sendMonthlyReportsToAllUsers();
+  });
 }

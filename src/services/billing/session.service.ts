@@ -2,6 +2,7 @@
 import { appDbQuery } from '../../config/database.js';
 import logger from '../../config/logger.js';
 
+const RATE_PER_KWH = parseFloat(process.env.CHARGING_RATE_PER_KWH ?? '8.5');
 export interface SessionStartData {
   appUserId: number;
   steveTransactionPk?: number;
@@ -21,7 +22,7 @@ export interface SessionStopData {
  * Create a new billing session record when charging starts
  */
 export async function startBillingSession(data: SessionStartData): Promise<{ sessionId: number }> {
-  logger.info(`💰 Starting billing session for user ${data.appUserId}`, {
+  logger.info(` Starting billing session for user ${data.appUserId}`, {
     chargeBoxId: data.chargeBoxId,
     idTag: data.idTag
   });
@@ -57,7 +58,7 @@ export async function completeBillingSession(data: SessionStopData): Promise<{
   energyKwh: number;
   totalCost: number;
 }> {
-  logger.info(`💰 Completing billing session for transaction ${data.steveTransactionPk}`, {
+  logger.info(` Completing billing session for transaction ${data.steveTransactionPk}`, {
     endMeterValue: data.endMeterValue,
     stopReason: data.stopReason
   });
@@ -74,11 +75,10 @@ export async function completeBillingSession(data: SessionStopData): Promise<{
     throw new Error(`No active session found for SteVe transaction ${data.steveTransactionPk}`);
   }
 
-  // Calculate energy and cost
   const startValue = session.start_meter_value || 0;
-  const energyKwh = Math.round((data.endMeterValue - startValue) / 10) / 100; // Wh → kWh, 3 decimals
-  const totalCost = Math.round((energyKwh * session.rate_per_kwh + session.session_fee) * 100) / 100;
-
+  // Calculate energy and cost
+  const energyKwh = +((data.endMeterValue - startValue) / 1000).toFixed(3);
+  const totalCost = +(energyKwh * RATE_PER_KWH + session.session_fee).toFixed(2);
   // Update session
   await appDbQuery(`
     UPDATE charging_sessions
@@ -91,7 +91,7 @@ export async function completeBillingSession(data: SessionStopData): Promise<{
     WHERE steve_transaction_pk = ?
   `, [data.endMeterValue, data.stopReason || 'Remote', data.steveTransactionPk]);
 
-  logger.info(`✅ Billing session completed: ${energyKwh} kWh, $${totalCost}`, {
+  logger.info(` Billing session completed: ${energyKwh} kWh, $${totalCost}`, {
     sessionId: session.session_id,
     steveTransactionPk: data.steveTransactionPk
   });

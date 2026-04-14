@@ -1,10 +1,11 @@
 // src/services/ocpp/steve-adapter.ts
 // Simplified Charger Status Model for VoltStartEV Backend
-import { steveQuery } from '../../config/database.js';
-import logger from '../../config/logger.js'; // ✅ FIX: Import logger instance, not winston
+import { steveQuery, appDbQuery } from '../../config/database.js';  
 import { ChargePointStatusSchema } from '../../types/ocpp-1.6';
 import { handleStatusNotification, handleStartTransaction, handleStopTransaction } from './ocpp-message-handler.js';
 import { z } from 'zod';
+
+import logger from '../../config/logger.js';
 
 // ─────────────────────────────────────────────────────
 // SIMPLIFIED STATUS MODEL (User-facing)
@@ -18,15 +19,17 @@ export interface ChargerSummary {
   totalConnectors?: number;
   estimatedWait?: number | null;
   errorDetails?: Array<{ connectorId: number; errorCode: string; errorInfo: string }>;
-  capabilities?: {
-    powerType: string;
-    maxPower: number;
-    connectorTypes: string[];
-  };
-  // Optional metadata for list view
+  capabilities?: { powerType: string; maxPower: number; connectorTypes: string[] };
   name?: string;
+  description?: string;
+  street?: string;
+  city?: string;
+  latitude?: number | null;
+  longitude?: number | null;
+  distance?: number | null;
   location?: { lat: number; lng: number };
   reason?: string;
+  connectorStatuses?: Array<{ connectorId: number; status: string }>;
 }
 
 // ─────────────────────────────────────────────────────
@@ -46,6 +49,40 @@ export interface ChargerDetails {
   registrationStatus: 'Accepted' | 'Pending' | 'Rejected';
   lastHeartbeat: Date | null;
   connectors: ConnectorStatus[];
+}
+
+// ─────────────────────────────────────────────────────
+// Fetch charger config from app database
+// ─────────────────────────────────────────────────────
+
+interface ChargerConfig {
+  chargeBoxId: string;
+  maxPower: number;
+  powerType: string;
+}
+
+async function getChargerConfigsMap(): Promise<Record<string, ChargerConfig>> {
+  try {
+    const rows = await appDbQuery<any>(`
+      SELECT charge_box_id, max_power_w, power_type
+      FROM charger_config
+    `);
+
+    const map: Record<string, ChargerConfig> = {};
+    
+    rows.forEach((row: any) => {
+      map[row.charge_box_id] = {
+        chargeBoxId: row.charge_box_id,
+        maxPower: row.max_power_w,
+        powerType: row.power_type,
+      };
+    });
+
+    return map;
+  } catch (error) {
+    logger.error('Failed to fetch charger configs', { error });
+    return {};  // Return empty map on error
+  }
 }
 
 // ─────────────────────────────────────────────────────
@@ -110,6 +147,7 @@ export async function getChargerStatus(chargeBoxId: string): Promise<ChargerSumm
   // This handles SAP Simulator scenarios where Heartbeat isn't sent but StatusNotification is
   
   // Step 4: Get connector count and latest statuses
+  // Exclude connector 0 (charger itself, not a physical port)
   const connectors = await steveQuery<any>(`
     SELECT 
       c.connector_id,
@@ -119,15 +157,16 @@ export async function getChargerStatus(chargeBoxId: string): Promise<ChargerSumm
     FROM connector c
     LEFT JOIN connector_status cs ON cs.connector_pk = c.connector_pk
     WHERE c.charge_box_id = ?
-    AND (
-      cs.connector_pk IS NULL 
-      OR NOT EXISTS (
-        SELECT 1
-        FROM connector_status cs2
-        WHERE cs2.connector_pk = cs.connector_pk
-        AND cs2.status_timestamp > cs.status_timestamp
+      AND c.connector_id > 0  --  Exclude connector 0 (charger itself)
+      AND (
+        cs.connector_pk IS NULL 
+        OR NOT EXISTS (
+          SELECT 1
+          FROM connector_status cs2
+          WHERE cs2.connector_pk = cs.connector_pk
+          AND cs2.status_timestamp > cs.status_timestamp
+        )
       )
-    )
     ORDER BY c.connector_id
   `, [chargeBoxId]);
   
@@ -165,9 +204,13 @@ export async function getChargerStatus(chargeBoxId: string): Promise<ChargerSumm
     status = 'Available';
   }
   
+  // Fetch config from app database
+  const configMap = await getChargerConfigsMap();
+  const config = configMap[chargeBoxId];
+  
   const capabilities = {
-    powerType: 'AC_3_PHASE',
-    maxPower: 22000,
+    powerType: config?.powerType || 'AC_3_PHASE',
+    maxPower: config?.maxPower || 22000,  // Fallback to 22kW if no config
     connectorTypes: ['Type2', 'CCS']
   };
   
@@ -187,35 +230,152 @@ export async function getChargerStatus(chargeBoxId: string): Promise<ChargerSumm
 // SIMPLIFIED: Get all chargers with status summary (list view)
 // ─────────────────────────────────────────────────────
 
-export async function getAllChargers(): Promise<ChargerSummary[]> {
-  // Get all accepted chargers with vendor/model info
+export async function getAllChargers(userLat?: number, userLng?: number): Promise<ChargerSummary[]> {
+  // Fetch charger configs map once
+  const configMap = await getChargerConfigsMap();
+
+  // Single query for all charger info + addresses
   const chargers = await steveQuery<any>(`
     SELECT 
-      charge_box_id, 
-      last_heartbeat_timestamp, 
-      registration_status,
-      charge_point_vendor,
-      charge_point_model
-    FROM charge_box
-    WHERE registration_status = 'Accepted'
-    ORDER BY charge_box_id
+      cb.charge_box_id, 
+      cb.last_heartbeat_timestamp, 
+      cb.registration_status,
+      cb.charge_point_vendor,
+      cb.charge_point_model,
+      cb.description,
+      a.street,
+      a.city,
+      a.latitude,
+      a.longitude
+    FROM charge_box cb
+    LEFT JOIN address a ON a.address_pk = cb.address_pk
+    WHERE cb.registration_status = 'Accepted'
+    ORDER BY cb.charge_box_id
   `);
-  
-  // Get simplified status for each charger
-  const summaries = await Promise.all(
-    chargers.map(async (c: any) => {
-      const summary = await getChargerStatus(c.charge_box_id);
-      return {
-        ...summary,
-        // Add optional list-view metadata
-        name: `${c.charge_point_vendor || ''} ${c.charge_point_model || ''}`.trim() || c.charge_box_id,
-      };
-    })
-  );
-  
+
+  // Single query for ALL connector statuses at once
+  //  FIX: Exclude connector 0 (charger itself, not a physical port)
+  const allConnectors = await steveQuery<any>(`
+    SELECT 
+      c.charge_box_id,
+      c.connector_id,
+      cs.status as connector_status,
+      cs.error_code,
+      cs.error_info
+    FROM connector c
+    LEFT JOIN connector_status cs ON cs.connector_pk = c.connector_pk
+    WHERE c.connector_id > 0  --  Exclude connector 0
+      AND NOT EXISTS (
+        SELECT 1 FROM connector_status cs2
+        WHERE cs2.connector_pk = cs.connector_pk
+        AND cs2.status_timestamp > cs.status_timestamp
+      )
+    ORDER BY c.charge_box_id, c.connector_id
+  `);
+
+  // Single query for latest connector activity per charger
+  const activityMap = new Map<string, number>();
+  const activities = await steveQuery<any>(`
+    SELECT c.charge_box_id, MAX(cs.status_timestamp) as latest
+    FROM connector_status cs
+    JOIN connector c ON c.connector_pk = cs.connector_pk
+    GROUP BY c.charge_box_id
+  `);
+  activities.forEach((a: any) => {
+    activityMap.set(a.charge_box_id, new Date(a.latest).getTime());
+  });
+
+  // Group connectors by charger
+  const connectorMap = new Map<string, any[]>();
+  allConnectors.forEach((c: any) => {
+    if (!connectorMap.has(c.charge_box_id)) connectorMap.set(c.charge_box_id, []);
+    connectorMap.get(c.charge_box_id)!.push(c);
+  });
+
+  const now = Date.now();
+  const heartbeatThreshold = 5 * 60 * 1000;
+  const activityThreshold = 60 * 60 * 1000;
+
+  const summaries = chargers.map((c: any) => {
+    const connectors = connectorMap.get(c.charge_box_id) || [];
+    const lastHeartbeat = c.last_heartbeat_timestamp 
+      ? new Date(c.last_heartbeat_timestamp).getTime() : 0;
+    const latestActivity = activityMap.get(c.charge_box_id) || 0;
+    const heartbeatStale = (now - lastHeartbeat) > heartbeatThreshold;
+    const activityStale = (now - latestActivity) > activityThreshold;
+
+    // Determine status
+    let status: ChargerSummary['status'] = 'Unknown';
+    if (heartbeatStale && activityStale && c.registration_status !== 'Accepted') {
+      status = 'Offline';
+    } else {
+      const availableCount = connectors.filter((x: any) => x.connector_status === 'Available').length;
+      const faultedCount = connectors.filter((x: any) => 
+        x.connector_status === 'Faulted' || (x.error_code && x.error_code !== 'NoError')).length;
+      const busyCount = connectors.filter((x: any) => 
+        ['Charging','Preparing','SuspendedEV','SuspendedEVSE','Finishing'].includes(x.connector_status)).length;
+
+      if (faultedCount > 0) status = 'Faulted';
+      else if (availableCount === 0 && busyCount > 0) status = 'Busy';
+      else if (availableCount > 0) status = 'Available';
+    }
+
+    const availableCount = connectors.filter((x: any) => x.connector_status === 'Available').length;
+
+    let distance: number | null = null;
+    if (userLat && userLng && c.latitude && c.longitude) {
+      distance = haversineDistance(userLat, userLng, 
+        parseFloat(c.latitude), parseFloat(c.longitude));
+      distance = Math.round(distance * 10) / 10;
+    }
+
+    // Fetch config from app database
+    const config = configMap[c.charge_box_id];
+    const capabilities = {
+      powerType: config?.powerType || 'AC_3_PHASE',
+      maxPower: config?.maxPower || 22000,  // Fallback to 22kW if no config
+      connectorTypes: ['Type2', 'CCS']
+    };
+
+    return {
+      chargeBoxId: c.charge_box_id,
+      status,
+      availableConnectors: availableCount,
+      totalConnectors: connectors.length,
+      connectorStatuses: connectors.map((conn: any) => ({
+        connectorId: conn.connector_id,
+        status: conn.connector_status || 'Unknown',
+      })),
+      name: `${c.charge_point_vendor || ''} ${c.charge_point_model || ''}`.trim(),
+      description: c.description,
+      street: c.street,
+      city: c.city,
+      latitude: c.latitude ? parseFloat(c.latitude) : null,
+      longitude: c.longitude ? parseFloat(c.longitude) : null,
+      distance,
+      lastSeen: c.last_heartbeat_timestamp,
+      capabilities,  
+    };
+  });
+
+  if (userLat && userLng) {
+    summaries.sort((a, b) => (a.distance ?? 999) - (b.distance ?? 999));
+  }
+
   return summaries;
 }
 
+
+// Haversine formula - distance in km
+function haversineDistance(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLng = (lng2 - lng1) * Math.PI / 180;
+  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLng/2) * Math.sin(dLng/2);
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
 
 // ─────────────────────────────────────────────────────
 // DETAILED: Get charger with full connector details (optional advanced use)
@@ -224,53 +384,55 @@ export async function getAllChargers(): Promise<ChargerSummary[]> {
 export async function getChargerById(chargeBoxId: string): Promise<ChargerDetails | null> {
   // Step 1: Verify charger exists and is accepted
   const [charger] = await steveQuery<any>(`
-    SELECT 
+    SELECT
       charge_box_id,
       registration_status,
       last_heartbeat_timestamp
     FROM charge_box
     WHERE charge_box_id = ? AND registration_status = 'Accepted'
   `, [chargeBoxId]);
-  
+
   if (!charger) return null;
-  
+
   // Step 2: Get connectors and their latest status using subqueries
+  // Exclude connector 0 (charger itself, not a physical port)
   const connectors = await steveQuery<any>(`
-    SELECT 
+    SELECT
       c.connector_id,
       (
-        SELECT status 
-        FROM connector_status cs 
-        WHERE cs.connector_pk = c.connector_pk 
-        ORDER BY status_timestamp DESC 
+        SELECT status
+        FROM connector_status cs
+        WHERE cs.connector_pk = c.connector_pk
+        ORDER BY status_timestamp DESC
         LIMIT 1
       ) as connector_status,
       (
-        SELECT error_code 
-        FROM connector_status cs 
-        WHERE cs.connector_pk = c.connector_pk 
-        ORDER BY status_timestamp DESC 
+        SELECT error_code
+        FROM connector_status cs
+        WHERE cs.connector_pk = c.connector_pk
+        ORDER BY status_timestamp DESC
         LIMIT 1
       ) as error_code,
       (
-        SELECT error_info 
-        FROM connector_status cs 
-        WHERE cs.connector_pk = c.connector_pk 
-        ORDER BY status_timestamp DESC 
+        SELECT error_info
+        FROM connector_status cs
+        WHERE cs.connector_pk = c.connector_pk
+        ORDER BY status_timestamp DESC
         LIMIT 1
       ) as error_info,
       (
-        SELECT status_timestamp 
-        FROM connector_status cs 
-        WHERE cs.connector_pk = c.connector_pk 
-        ORDER BY status_timestamp DESC 
+        SELECT status_timestamp
+        FROM connector_status cs
+        WHERE cs.connector_pk = c.connector_pk
+        ORDER BY status_timestamp DESC
         LIMIT 1
       ) as status_timestamp
     FROM connector c
     WHERE c.charge_box_id = ?
+      AND c.connector_id > 0  --  Exclude connector 0
     ORDER BY c.connector_id
   `, [chargeBoxId]);
-  
+
   // Step 3: Build response with detailed connector info
   return {
     chargeBoxId: charger.charge_box_id,
@@ -293,11 +455,17 @@ export async function getChargerById(chargeBoxId: string): Promise<ChargerDetail
 // ─────────────────────────────────────────────────────
 
 export async function getConnectorMetrics(
-  chargeBoxId: string, 
+  chargeBoxId: string,
   connectorId: number
 ): Promise<Record<string, any>[]> {
+  // Validate connectorId > 0 (0 = charger itself, not a port)
+  if (connectorId <= 0) {
+    logger.warn(`Invalid connectorId ${connectorId} for metrics request on ${chargeBoxId}. Connector IDs must be 1 or higher.`);
+    return [];
+  }
+
   const metrics = await steveQuery<any>(`
-    SELECT 
+    SELECT
       cmv.value_timestamp,
       cmv.value,
       cmv.measurand,
@@ -308,7 +476,7 @@ export async function getConnectorMetrics(
     FROM connector_meter_value cmv
     JOIN connector c ON c.connector_pk = cmv.connector_pk
     JOIN charge_box cb ON cb.charge_box_id = c.charge_box_id
-    WHERE cb.charge_box_id = ? 
+    WHERE cb.charge_box_id = ?
       AND c.connector_id = ?
       AND cmv.value_timestamp >= DATE_SUB(NOW(), INTERVAL 1 HOUR)
     ORDER BY cmv.value_timestamp DESC
@@ -318,7 +486,7 @@ export async function getConnectorMetrics(
   return metrics.map((m: any) => ({
     timestamp: m.value_timestamp,
     measurand: m.measurand,
-    value: String(m.value),  // ✅ String per OCPP 1.6 spec
+    value: String(m.value),  // String per OCPP 1.6 spec
     unit: m.unit,
     phase: m.phase,
     location: m.location,
@@ -332,18 +500,18 @@ export async function getConnectorMetrics(
 
 export async function isChargerOnline(chargeBoxId: string, timeoutMinutes = 5): Promise<boolean> {
   const [result] = await steveQuery<any>(`
-    SELECT last_heartbeat_timestamp 
-    FROM charge_box 
-    WHERE charge_box_id = ? 
+    SELECT last_heartbeat_timestamp
+    FROM charge_box
+    WHERE charge_box_id = ?
       AND registration_status = 'Accepted'
   `, [chargeBoxId]);
-  
+
   if (!result?.last_heartbeat_timestamp) return false;
-  
+
   const lastHeartbeat = new Date(result.last_heartbeat_timestamp).getTime();
   const now = Date.now();
   const diffMinutes = (now - lastHeartbeat) / (1000 * 60);
-  
+
   return diffMinutes <= timeoutMinutes;
 }
 
@@ -364,10 +532,10 @@ export function registerOCPPMessageHandlers(steveWebSocketClient: any) {
       // OCPP Call format: [2, messageId, action, payload]
       if (Array.isArray(ocppMsg) && ocppMsg[0] === 2) {
         const [, messageId, action, payload] = ocppMsg;
-        
-        // ✅ FIX: Extract chargeBoxId from WebSocket URL or session metadata
+
+        //  FIX: Extract chargeBoxId from WebSocket URL or session metadata
         const chargeBoxId = extractChargeBoxIdFromSession(steveWebSocketClient);
-        
+
         logger.debug(`📡 OCPP ${action} from ${chargeBoxId}: ${JSON.stringify(payload).substring(0, 200)}...`);
 
         switch (action) {
@@ -382,7 +550,7 @@ export function registerOCPPMessageHandlers(steveWebSocketClient: any) {
                 if (transactionPk) {
                   handleStartTransaction(chargeBoxId, payload.connectorId, payload, transactionPk);
                 } else {
-                  logger.warn(`⚠️ Could not resolve transaction_pk for StartTransaction on ${chargeBoxId}`);
+                  logger.warn(` Could not resolve transaction_pk for StartTransaction on ${chargeBoxId}`);
                 }
               })
               .catch(err => logger.error('Failed to resolve transaction_pk', { err }));
@@ -394,7 +562,7 @@ export function registerOCPPMessageHandlers(steveWebSocketClient: any) {
                 if (transactionPk) {
                   handleStopTransaction(chargeBoxId, payload.connectorId, payload, transactionPk);
                 } else {
-                  logger.warn(`⚠️ Could not resolve transaction_pk for StopTransaction on ${chargeBoxId}`);
+                  logger.warn(` Could not resolve transaction_pk for StopTransaction on ${chargeBoxId}`);
                 }
               })
               .catch(err => logger.error('Failed to resolve transaction_pk', { err }));
@@ -402,7 +570,7 @@ export function registerOCPPMessageHandlers(steveWebSocketClient: any) {
 
           // Handle other OCPP messages as needed
           default:
-            logger.debug(`📡 Unhandled OCPP action: ${action}`);
+            logger.debug(` Unhandled OCPP action: ${action}`);
         }
       }
     } catch (error) {
@@ -410,7 +578,7 @@ export function registerOCPPMessageHandlers(steveWebSocketClient: any) {
     }
   });
 
-  logger.info('✅ OCPP message handlers registered');
+  logger.info(' OCPP message handlers registered');
 }
 
 // Helper: Extract chargeBoxId from WebSocket session
@@ -420,14 +588,14 @@ function extractChargeBoxIdFromSession(client: any): string {
     const match = client.url.match(/CentralSystemService\/([^/?]+)/);
     if (match && match[1]) return match[1];
   }
-  
+
   // Strategy 2: Check client.chargeBoxId if set by your WebSocket wrapper
   if (client.chargeBoxId) return client.chargeBoxId;
-  
+
   // Strategy 3: Check session metadata if available
   if (client.session?.chargeBoxId) return client.session.chargeBoxId;
-  
-  logger.warn('⚠️ Could not extract chargeBoxId from WebSocket session');
+
+  logger.warn(' Could not extract chargeBoxId from WebSocket session');
   return 'unknown';
 }
 
@@ -438,7 +606,7 @@ async function getTransactionPkFromSteVe(chargeBoxId: string, payload: any): Pro
       SELECT ts.transaction_pk
       FROM transaction_start ts
       JOIN connector c ON c.connector_pk = ts.connector_pk
-      WHERE c.charge_box_id = ? 
+      WHERE c.charge_box_id = ?
         AND c.connector_id = ?
         AND ts.id_tag = ?
         AND ts.start_timestamp >= DATE_SUB(NOW(), INTERVAL 5 MINUTE)

@@ -4,8 +4,10 @@ import logger from '../../config/logger.js';
 import { appDbExecute, appDbQuery, steveQuery } from '../../config/database.js';
 import { websocketEmitter } from '../websocket/emitter.service.js';
 import { extractTelemetry } from './telemetry-extractor.js';
+import { sendPushToUser } from '../notifications/push.service.js';
+import { getPricingForCharger, calculateCost } from '../billing/pricing.service.js';
 
-const RATE_PER_KWH = parseFloat(process.env.CHARGING_RATE_PER_KWH ?? '8.5');
+//const RATE_PER_KWH = parseFloat(process.env.CHARGING_RATE_PER_KWH ?? '8.5');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper to convert ISO 8601 → MySQL DATETIME format
@@ -74,9 +76,9 @@ export const webhookEventProcessor = {
     // --- Idempotency: skip if already processed ---
     try {
       await appDbExecute(
-        `INSERT INTO webhook_events (event_id, event_type, processed_at)
-         VALUES (?, ?, NOW())`,
-        [event.eventId, event.eventType]
+       `INSERT INTO webhook_events (event_id, event_type, charge_box_id, processed_at)
+       VALUES (?, ?, ?, NOW())`,
+       [event.eventId, event.eventType, event.chargeBoxId]
       );
     } catch (err: any) {
       if (err.code === 'ER_DUP_ENTRY') {
@@ -165,15 +167,238 @@ async function handleTransactionStarted(event: any): Promise<void> {
     });
     logger.info(`WebSocket session_started → userId=${userId} txId=${event.transactionId}`);
   }
+  // ──  Push notification ──
+  await sendPushToUser(userId, {
+    title: '⚡ Charging Started!',
+    body: `${event.chargeBoxId} · Connector ${event.connectorId} · Session active`,
+    data: {
+      transactionId: event.transactionId,
+      chargeBoxId: event.chargeBoxId,
+      action: 'view_session',
+    },
+    channelId: 'charging',
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+async function handleMeterValues(event: any): Promise<void> {
+  logger.debug(` Processing MeterValues for tx=${event.transactionId}`);
+
+  // 1. Get active session
+  const sessions = await appDbQuery<{
+    app_user_id: number | null;
+    start_meter_value: number;
+    start_time: string | null;  
+  }>(
+    `SELECT app_user_id, start_meter_value, start_time 
+     FROM charging_sessions
+     WHERE steve_transaction_pk = ? 
+       AND status = 'active' 
+     LIMIT 1`,
+    [event.transactionId]
+  );
+
+  let session: { 
+    app_user_id: number | null; 
+    start_meter_value: number;
+    start_time: string | null; 
+  } | undefined = sessions[0];
+  
+  if (!session) {
+    try {
+      const steveTx = await steveQuery<any>(
+        `SELECT stop_timestamp, stop_reason 
+         FROM ocpp_transaction 
+         WHERE transaction_pk = ? 
+         LIMIT 1`,
+        [event.transactionId]
+      );
+
+      if (steveTx[0]?.stop_timestamp) {
+        logger.info(`TX ${event.transactionId} already completed in SteVe (stop: ${steveTx[0].stop_timestamp}), skipping fallback`);
+        return;
+      }
+    } catch (error) {
+      logger.warn(`Failed to check SteVe transaction status for tx=${event.transactionId}`, { error });
+    }
+
+    logger.warn(` No active session for tx=${event.transactionId}, creating fallback...`);
+    
+    await appDbExecute(`
+      INSERT INTO charging_sessions (
+        steve_transaction_pk,
+        charge_box_id,
+        connector_id,
+        id_tag,
+        start_time,
+        start_meter_value,
+        status
+      ) VALUES (?, ?, ?, ?, ?, ?, 'active')
+      ON DUPLICATE KEY UPDATE
+        status = 'active',
+        updated_at = NOW(),
+        app_user_id = COALESCE(app_user_id, VALUES(app_user_id)),
+        id_tag = CASE 
+          WHEN id_tag = 'PENDING_TAG_LOOKUP' THEN VALUES(id_tag)
+          ELSE id_tag
+        END,
+        start_time = COALESCE(start_time, VALUES(start_time)),
+        start_meter_value = COALESCE(start_meter_value, VALUES(start_meter_value))
+    `, [
+      event.transactionId,
+      event.chargeBoxId,
+      event.connectorId,
+      'PENDING_TAG_LOOKUP',
+      isoToMySQL(event.timestamp),
+      0,
+    ]);
+    
+    logger.info(` Created fallback session for tx=${event.transactionId}`);
+    
+    const fallbackSessions = await appDbQuery<{ 
+      app_user_id: number | null; 
+      start_meter_value: number;
+      start_time: string | null; 
+    }>(`
+      SELECT app_user_id, start_meter_value, start_time 
+      FROM charging_sessions
+      WHERE steve_transaction_pk = ? AND status = 'active' LIMIT 1
+    `, [event.transactionId]);
+
+    session = fallbackSessions[0];
+    
+    if (!session) {
+      logger.error(` Failed to retrieve session (even after fallback) for tx=${event.transactionId}`);
+      return;
+    }
+    
+    if (!session.app_user_id) {
+      logger.debug(` No userId for session tx=${event.transactionId}, skipping WebSocket emit`);
+    }
+  }
+
+  // 2. Extract telemetry
+  const telemetry = extractTelemetry(event.sampledValues);
+
+  if (!telemetry || telemetry.energyKwh == null) {
+    logger.debug(` No valid energy value found in payload`);
+    return;
+  }
+
+  const socPercent = telemetry.socPercent;
+
+  // Convert kWh back to Wh for DB storage
+  const meterWh = telemetry.energyKwh * 1000;
+
+  const startMeter = session?.start_meter_value ?? 0;
+  
+  await appDbExecute(
+    `UPDATE charging_sessions 
+     SET end_meter_value = ?, 
+         updated_at = NOW()
+     WHERE steve_transaction_pk = ?`,
+    [meterWh, event.transactionId] 
+  );
+
+  logger.debug(
+    ` Meter updated: tx=${event.transactionId}, end_meter_value=${meterWh} Wh`
+  );
+
+  // 3. Compute energy for realtime UI
+  const energyKwh = session.start_meter_value != null
+    ? +( (meterWh - session.start_meter_value) / 1000 ).toFixed(3)
+    : null;
+
+  // 4. Compute cost for live UI only
+  const pricing = await getPricingForCharger(event.chargeBoxId, event.connectorId);
+  
+  const durationMin = session.start_time  
+    ? Math.floor((Date.now() - new Date(session.start_time).getTime()) / 60000)
+    : 0;
+    
+  const powerKw = telemetry.powerW != null ? telemetry.powerW / 1000 : 0;  
+  
+  const costSoFar = pricing
+    ? calculateCost(pricing, energyKwh ?? 0, durationMin, powerKw)  
+    : 0;
+
+  // 5. Emit via WebSocket
+  if (session.app_user_id !== null) {
+    websocketEmitter.emitToUser(session.app_user_id, 'telemetry:update', {
+      transactionId: event.transactionId,
+      chargeBoxId: event.chargeBoxId,
+      connectorId: event.connectorId,
+      timestamp: event.timestamp,
+
+      // Realtime values for UI
+      meterWh,
+      energyKwh,
+      costSoFar,
+
+      // Electrical telemetry
+      powerW: telemetry.powerW,
+      currentA: telemetry.currentA,
+      voltageV: telemetry.voltageV,
+      socPercent: telemetry.socPercent,
+      currentL1: telemetry.currentL1,
+      currentL2: telemetry.currentL2,
+      currentL3: telemetry.currentL3,
+    });
+  }
+  
+  logger.debug(` Emitted telemetry to user ${session.app_user_id}`);
+  logger.info(`Telemetry update: tx=${event.transactionId}`, {
+    chargeBoxId:  event.chargeBoxId,
+    connectorId:  event.connectorId,
+    meterWh:      meterWh,
+    energyKwh:    energyKwh,
+    powerW:       telemetry.powerW,
+    currentA:     telemetry.currentA,
+    voltageV:     telemetry.voltageV,
+    socPercent:   telemetry.socPercent,
+    costSoFar:    costSoFar
+  });
+}
+// ─────────────────────────────────────────────────────────────────────────────
+export async function handleConnectorStatus(payload: SteveConnectorStatusPayload): Promise<void> {
+  logger.info(` Connector status update: ${payload.chargeBoxId}:${payload.connectorId} → ${payload.status}`, {
+    errorCode: payload.errorCode,
+    info: payload.info,
+    vendorId: payload.vendorId
+  });
+
+  websocketEmitter.emitChargerStatus(payload.chargeBoxId, payload.connectorId, payload.status, payload.errorCode ?? undefined);
+  if (payload.status === 'Faulted') {
+    // Find active session on this connector
+    const sessions = await appDbQuery<{ app_user_id: number }>(
+      `SELECT app_user_id FROM charging_sessions 
+       WHERE charge_box_id = ? AND connector_id = ? AND status = 'active' LIMIT 1`,
+      [payload.chargeBoxId, payload.connectorId]
+    );
+    if (sessions[0]) {
+      await sendPushToUser(sessions[0].app_user_id, {
+        title: '⚠️ Charger Fault Detected',
+        body: `${payload.chargeBoxId} reported an error: ${payload.errorCode}. Check your session.`,
+        data: { chargeBoxId: payload.chargeBoxId, action: 'view_session' },
+        channelId: 'alerts',
+      });
+    }
+  }  
+  logger.debug(` Emitted connector:status to subscribers of ${payload.chargeBoxId}`);
+}
+
 
 async function handleTransactionEnded(event: any): Promise<void> {
   logger.info(`TX ended: txId=${event.transactionId} reason=${event.stopReason}`);
 
-  const sessions = await appDbQuery<{ app_user_id: number; start_meter_value: number }>(
-    `SELECT app_user_id, start_meter_value FROM charging_sessions
+  const sessions = await appDbQuery<{
+    app_user_id: number;
+    start_meter_value: number;
+    end_meter_value: number | null;
+    start_time: string | null;  
+  }>(
+    `SELECT app_user_id, start_meter_value, start_time 
+     FROM charging_sessions
      WHERE steve_transaction_pk = ? LIMIT 1`,
     [event.transactionId]
   );
@@ -181,7 +406,6 @@ async function handleTransactionEnded(event: any): Promise<void> {
 
   if (!session) {
     logger.warn(` No session found for transaction ${event.transactionId}, creating new record`);
-    // Create new record if start event was missed
     await handleTransactionStarted({
       ...event,
       startTime: event.stopTime,
@@ -192,9 +416,29 @@ async function handleTransactionEnded(event: any): Promise<void> {
 
   const meterStop  = Number(event.meterStop) || 0;
   const meterStart = session?.start_meter_value ?? 0;
-  const energyKwh  = Math.max(0, (meterStop - meterStart) / 1000);
-  const totalCost  = +(energyKwh * RATE_PER_KWH + 0.50).toFixed(2);
-  const stopTimeMySQL = isoToMySQL(event.stopTime);
+  const lastKnownEnd = session?.end_meter_value ?? meterStart;
+  const effectiveStop = Math.max(meterStop, lastKnownEnd);
+  const startWh = Math.round(meterStart * 1000) / 1000;
+  const stopWh = Math.round(effectiveStop * 1000) / 1000;
+  const energyKwh = +((stopWh - startWh) / 1000).toFixed(3);
+
+  const pricing = await getPricingForCharger(event.chargeBoxId, event.connectorId);
+
+  // Define stopTimeMySQL BEFORE using it in durationMinutes calculation
+  const stopTimeMySQL = isoToMySQL(event.stopTime);  
+
+  const durationMinutes = session.start_time && stopTimeMySQL 
+    ? Math.floor((new Date(stopTimeMySQL).getTime() - new Date(session.start_time).getTime()) / 60000)
+    : 0;
+
+  const totalCost = pricing
+    ? calculateCost(pricing, energyKwh, durationMinutes, 0)
+    : +(energyKwh * 8.5 + 0.50).toFixed(2);
+
+  const isPowerLoss = event.stopReason === 'PowerLoss' || event.stopReason === 'PowerReset';
+  const userMessage = isPowerLoss
+     ? 'Charging ended due to charger restart. You were billed for energy delivered.'
+     : `Charging completed (${event.stopReason || 'normal stop'}).`;
 
   await appDbExecute(
     `UPDATE charging_sessions
@@ -220,157 +464,29 @@ async function handleTransactionEnded(event: any): Promise<void> {
       energyKwh:     +energyKwh.toFixed(4),
       stopReason:    event.stopReason,
       stopTime:      event.stopTime,
-    });   
-    logger.info(`WebSocket session_completed → userId=${session.app_user_id} energy=${energyKwh}kWh cost=₹${totalCost}`);
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-async function handleMeterValues(event: any): Promise<void> {
-  logger.debug(` Processing MeterValues for tx=${event.transactionId}`);
-
-  // 1. Get active session
-  const sessions = await appDbQuery<{
-    app_user_id: number;
-    start_meter_value: number;
-  }>(
-    `SELECT app_user_id, start_meter_value 
-     FROM charging_sessions
-     WHERE steve_transaction_pk = ? 
-       AND status = 'active' 
-     LIMIT 1`,
-    [event.transactionId]
-  );
-
-  const session = sessions[0];
-  if (!session) {
-    // FALLBACK: Create minimal session if StartTransaction webhook was lost/delayed
-    logger.warn(` No active session for tx=${event.transactionId}, creating fallback...`);
-    
-    // Insert with placeholders - real StartTransaction webhook will merge values via ON DUPLICATE
-    await appDbExecute(`
-      INSERT INTO charging_sessions (
-        steve_transaction_pk,
-        charge_box_id,
-        connector_id,
-        id_tag,
-        start_time,
-        start_meter_value,
-        status,
-        app_user_id
-      ) VALUES (?, ?, ?, ?, ?, ?, 'active', NULL)
-      ON DUPLICATE KEY UPDATE
-        status = 'active',
-        updated_at = NOW(),
-        -- Merge real values when StartTransaction webhook arrives:
-        app_user_id = COALESCE(app_user_id, VALUES(app_user_id)),
-        id_tag = CASE 
-          WHEN id_tag = 'PENDING_TAG_LOOKUP' THEN VALUES(id_tag)
-          ELSE id_tag
-        END,
-        start_time = COALESCE(start_time, VALUES(start_time)),
-        start_meter_value = COALESCE(start_meter_value, VALUES(start_meter_value))
-    `, [
-      event.transactionId,
-      event.chargeBoxId,
-      event.connectorId,
-      'PENDING_TAG_LOOKUP',  // Placeholder for id_tag
-      isoToMySQL(event.timestamp),
-      0,  // start_meter_value placeholder
-      // app_user_id is NULL (last param in VALUES)
-    ]);
-    
-    logger.info(` Created fallback session for tx=${event.transactionId}`);
-    
-    //  Re-query to get the session for meter value update
-    const sessions = await appDbQuery<{ app_user_id: number | null; start_meter_value: number }>(`
-      SELECT app_user_id, start_meter_value FROM charging_sessions
-      WHERE steve_transaction_pk = ? AND status = 'active' LIMIT 1
-    `, [event.transactionId]);
-
-    const session = sessions[0] as { app_user_id: number | null; start_meter_value: number } | undefined; 
-    if (!session) {
-      logger.error(` Failed to retrieve fallback session for tx=${event.transactionId}`);
-      return;
-    }
-    
-    //  If no userId yet, skip WebSocket emit but still update DB
-    if (!session?.app_user_id) {
-      logger.debug(` No userId for fallback session tx=${event.transactionId}, skipping WebSocket emit`);
-      // Still continue to update end_meter_value below - DB update doesn't require userId
-    }
-  }
-
-  // 2. Extract telemetry
-  const telemetry = extractTelemetry(event.sampledValues);
-
-  if (!telemetry || telemetry.energyKwh == null) {
-    logger.debug(` No valid energy value found in payload`);
-    return;
-  }
-
-  //  FIX: Convert kWh back to Wh for DB storage
-  const meterWh = telemetry.energyKwh * 1000;
-
-  //  FIX: Update ONLY end_meter_value (NOT energy_kwh - it's generated!)
-  await appDbExecute(
-    `UPDATE charging_sessions 
-     SET end_meter_value = ?, 
-         updated_at = NOW()
-     WHERE steve_transaction_pk = ?`,
-    [meterWh, event.transactionId] 
-  );
-
-  logger.debug(
-    ` Meter updated: tx=${event.transactionId}, end_meter_value=${meterWh} Wh`
-  );
-
-  // 3. Compute energy for realtime UI (DB auto-calculates via generated column)
-  const energyKwh = session.start_meter_value != null
-    ? +( (meterWh - session.start_meter_value) / 1000 ).toFixed(3)
-    : null;
-
-  // 4. Compute cost for live UI only
-  const costSoFar = energyKwh !== null
-    ? +(energyKwh * RATE_PER_KWH + 0.50).toFixed(2)
-    : null;
-
-  // 5. Emit via WebSocket (if available)
-  // if (wsService) {
-  websocketEmitter.emitToUser(session.app_user_id, 'telemetry:update', {
-      transactionId: event.transactionId,
-      chargeBoxId: event.chargeBoxId,
-      connectorId: event.connectorId,
-      timestamp: event.timestamp,
-
-      //  Realtime values for UI
-      meterWh,              // Raw Wh value
-      energyKwh,            // Calculated kWh for display
-      costSoFar,            // Calculated cost for display
-
-      //  Electrical telemetry
-      powerW: telemetry.powerW,
-      currentA: telemetry.currentA,
-      voltageV: telemetry.voltageV,
-      socPercent: telemetry.socPercent,
-      currentL1: telemetry.currentL1,
-      currentL2: telemetry.currentL2,
-      currentL3: telemetry.currentL3,
+      isPowerLoss: isPowerLoss,
+      userMessage: userMessage,
+      requiresAttention: isPowerLoss
     });
 
-  logger.debug(` Emitted telemetry to user ${session.app_user_id}`);
-//  } else {
-//    logger.debug(`️ WebSocket not initialized, skipping emit`);
-//  }
-}
+    await sendPushToUser(session.app_user_id, {
+      title: isPowerLoss ? '⚠️ Charging Interrupted' : '🔋 Charging Complete!',
+      body: isPowerLoss
+        ? `Charger restarted on ${event.chargeBoxId}. You were billed for energy delivered.`
+        : `${event.chargeBoxId} · ${energyKwh.toFixed(2)} kWh · ₹${totalCost.toFixed(2)}`,
+      data: {
+        transactionId: event.transactionId,
+        action: 'view_summary',
+        energyKwh,
+        totalCost
+      },
+      channelId: isPowerLoss ? 'alerts' : 'charging',
+    });
 
-export async function handleConnectorStatus(payload: SteveConnectorStatusPayload): Promise<void> {
-  logger.info(` Connector status update: ${payload.chargeBoxId}:${payload.connectorId} → ${payload.status}`, {
-    errorCode: payload.errorCode,
-    info: payload.info,
-    vendorId: payload.vendorId
-  });
-
-  websocketEmitter.emitChargerStatus(payload.chargeBoxId, payload.connectorId, payload.status, payload.errorCode ?? undefined);
-  logger.debug(` Emitted connector:status to subscribers of ${payload.chargeBoxId}`);
-}
+    logger.info(`Session completed: ${energyKwh} kWh @ ₹${totalCost}`, { 
+       transactionId: event.transactionId,
+       stopReason: event.stopReason,
+       isPowerLoss: isPowerLoss
+    });
+  }
+} 
