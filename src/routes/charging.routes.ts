@@ -7,6 +7,11 @@ import { validateTagForUser, resolveUserIdForTag } from '../services/auth/tag-re
 import { reconciliationService } from '../services/reconciliation/reconciliation.service.js';
 import { websocketEmitter } from '../services/websocket/emitter.service.js';
 import { chargerStateCache } from '../cache/chargerState.js';
+import { 
+  isConnectorReservedByOther, 
+  markReservationUsed 
+} from '../services/reservations/reservation.service.js';
+
 import logger from '../config/logger.js';
 
 const router = Router();
@@ -41,7 +46,6 @@ router.post('/start', authenticateJwt, async (req: Request, res: Response) => {
         timestamp: new Date().toISOString()
       });
     }
-    
     // Check charger status (from cache or DB)
     const chargerStatus = await chargerStateCache.get(chargeBoxId, connectorId);
     if (chargerStatus?.status === 'Unavailable' || chargerStatus?.status === 'Faulted') {
@@ -64,6 +68,17 @@ router.post('/start', authenticateJwt, async (req: Request, res: Response) => {
         success: false,
         error: 'You already have an active charging session',
         sessionId: activeSession[0].session_id
+      });
+    }
+    const reservedByOther = await isConnectorReservedByOther(
+      chargeBoxId, connectorId, appUserId 
+    );
+
+    if (reservedByOther) {
+      return res.status(409).json({
+        success: false,
+        error: 'This connector is reserved by another user. Please wait or choose another connector.',
+        code: 'CONNECTOR_RESERVED'
       });
     }
 
@@ -99,7 +114,12 @@ router.post('/start', authenticateJwt, async (req: Request, res: Response) => {
       },
       timestamp: new Date().toISOString()
     });
-    
+    try {
+      await markReservationUsed(appUserId, chargeBoxId, connectorId);
+    } catch (err) {
+      logger.warn('Failed to mark reservation as used', { error: err });
+      // Don't fail the session start for this
+    }    
   } catch (error: any) {
     logger.error(' Failed to start charging session', { error });
     res.status(500).json({
@@ -152,14 +172,18 @@ router.post('/stop', authenticateJwt, async (req: Request, res: Response) => {
     }
     
     // Guard 2: already stopped — idempotent response, not an error
-    if (session.status === 'completed') {
+    if (session.status === 'completed' || session.status === 'interrupted') {
       return res.status(200).json({
         success: true,
         message: 'Session already stopped',
-        alreadyStopped: true
+        data: {
+          sessionId: session.session_id,
+          status: session.status,
+          endTime: session.end_time
+        }
       });
     }
-    
+
     // Guard 3: belongs to a different user
     if (Number(session.app_user_id) !== Number(appUserId)) {  
       return res.status(403).json({

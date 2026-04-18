@@ -26,8 +26,13 @@ import { startReconciliationJob } from './jobs/reconciliation.job.js';
 import { initializeWebSocketService } from './services/websocket/emitter.service.js';
 import { startReportsJob } from './jobs/reconciliation.job.js';
 import { verifySmtpConnection } from './services/email/email.service.js';
+import reservationRoutes from './routes/reservations.routes.js';
+import { startReservationJob } from './jobs/reservation.job.js';
+
 // AI Assistance 
 import assistantRoutes from './routes/assistant.routes.js';
+// Wallet 
+import walletRoutes from './routes/wallet.routes.js';
 
 import logger from './config/logger.js';
 // Load environment variables
@@ -60,10 +65,12 @@ app.use('/api/charging', chargingRoutes);
 app.use('/api/chargers', chargersRoutes);
 app.use('/api/telemetry', telemetryRoutes);
 app.use('/api/webhooks', webhooksRouter);
+app.use('/api/reservations', reservationRoutes);
 app.use('/', healthRoutes);
 // AI Assistance 
 app.use('/api/assistant', assistantRoutes);
-
+// Wallet 
+app.use('/api/wallet', walletRoutes);
 // Error handling middleware (must be last)
 app.use(errorHandler);
 
@@ -84,6 +91,7 @@ setWebSocketService(wsService);
 // Start reconciliation job
 startReconciliationJob();
 startReportsJob();
+startReservationJob();
 logger.info(' WebSocket services registered');
 
 // Start server

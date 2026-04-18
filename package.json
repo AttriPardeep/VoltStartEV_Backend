@@ -29,6 +29,7 @@
     "mysql2": "^3.9.2",
     "node-cron": "^4.2.1",
     "nodemailer": "^8.0.5",
+    "razorpay": "^2.9.6",
     "socket.io": "^4.7.4",
     "validator": "^13.15.26",
     "winston": "^3.11.0",

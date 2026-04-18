@@ -6,6 +6,7 @@ import { websocketEmitter } from '../websocket/emitter.service.js';
 import { extractTelemetry } from './telemetry-extractor.js';
 import { sendPushToUser } from '../notifications/push.service.js';
 import { getPricingForCharger, calculateCost } from '../billing/pricing.service.js';
+import { deductFromWallet } from '../wallet/wallet.service.js';
 
 //const RATE_PER_KWH = parseFloat(process.env.CHARGING_RATE_PER_KWH ?? '8.5');
 
@@ -206,20 +207,22 @@ async function handleMeterValues(event: any): Promise<void> {
   
   if (!session) {
     try {
-      const steveTx = await steveQuery<any>(
+      const [steveTx] = await steveQuery<any>(
         `SELECT stop_timestamp, stop_reason 
-         FROM ocpp_transaction 
+         FROM transaction 
          WHERE transaction_pk = ? 
          LIMIT 1`,
-        [event.transactionId]
+        [event.transactionId]  // Use event.transactionId (in scope)
       );
 
-      if (steveTx[0]?.stop_timestamp) {
-        logger.info(`TX ${event.transactionId} already completed in SteVe (stop: ${steveTx[0].stop_timestamp}), skipping fallback`);
+      // If SteVe shows transaction already stopped, skip fallback creation
+      if (steveTx?.stop_timestamp) {
+        logger.info(`TX ${event.transactionId} already completed in SteVe (stop: ${steveTx.stop_timestamp}), skipping fallback`);
         return;
       }
     } catch (error) {
       logger.warn(`Failed to check SteVe transaction status for tx=${event.transactionId}`, { error });
+      // Continue to fallback logic if query fails
     }
 
     logger.warn(` No active session for tx=${event.transactionId}, creating fallback...`);
@@ -254,7 +257,6 @@ async function handleMeterValues(event: any): Promise<void> {
     ]);
     
     logger.info(` Created fallback session for tx=${event.transactionId}`);
-    
     const fallbackSessions = await appDbQuery<{ 
       app_user_id: number | null; 
       start_meter_value: number;
@@ -279,19 +281,15 @@ async function handleMeterValues(event: any): Promise<void> {
 
   // 2. Extract telemetry
   const telemetry = extractTelemetry(event.sampledValues);
-
   if (!telemetry || telemetry.energyKwh == null) {
     logger.debug(` No valid energy value found in payload`);
     return;
   }
 
   const socPercent = telemetry.socPercent;
-
   // Convert kWh back to Wh for DB storage
   const meterWh = telemetry.energyKwh * 1000;
-
   const startMeter = session?.start_meter_value ?? 0;
-  
   await appDbExecute(
     `UPDATE charging_sessions 
      SET end_meter_value = ?, 
@@ -359,6 +357,7 @@ async function handleMeterValues(event: any): Promise<void> {
     costSoFar:    costSoFar
   });
 }
+
 // ─────────────────────────────────────────────────────────────────────────────
 export async function handleConnectorStatus(payload: SteveConnectorStatusPayload): Promise<void> {
   logger.info(` Connector status update: ${payload.chargeBoxId}:${payload.connectorId} → ${payload.status}`, {
@@ -392,12 +391,13 @@ async function handleTransactionEnded(event: any): Promise<void> {
   logger.info(`TX ended: txId=${event.transactionId} reason=${event.stopReason}`);
 
   const sessions = await appDbQuery<{
+    session_id: number;
     app_user_id: number;
     start_meter_value: number;
     end_meter_value: number | null;
     start_time: string | null;  
   }>(
-    `SELECT app_user_id, start_meter_value, start_time 
+    `SELECT session_id, app_user_id, start_meter_value, start_time 
      FROM charging_sessions
      WHERE steve_transaction_pk = ? LIMIT 1`,
     [event.transactionId]
@@ -456,6 +456,23 @@ async function handleTransactionEnded(event: any): Promise<void> {
       event.transactionId,
     ]
   );
+
+  if (session?.app_user_id && totalCost > 0) {
+    const deductResult = await deductFromWallet(
+      session.app_user_id,
+      totalCost,
+      session.session_id,
+      `Charging at ${event.chargeBoxId} · ${energyKwh.toFixed(3)} kWh`
+    );
+    if (!deductResult.success) {
+      logger.warn('Insufficient wallet balance for session', {
+        userId: session.app_user_id,
+        sessionId: session.session_id,
+        cost: totalCost,
+      });
+      // Payment status stays 'pending' — handle manually
+    }
+  }
 
   if (session?.app_user_id) {
     websocketEmitter.emitToUser(session.app_user_id, 'session_completed', {
