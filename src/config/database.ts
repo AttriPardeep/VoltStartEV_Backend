@@ -12,8 +12,10 @@ export const stevePool = mysql.createPool({
   password: process.env.STEVE_DB_PASSWORD,
   database: process.env.STEVE_DB_NAME || 'stevedb',
   waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
+  connectionLimit: 20,
+  queueLimit: 100,
+  connectTimeout:   15000,
+  idleTimeout:      60000,
   enableKeepAlive: true,
   keepAliveInitialDelay: 10000,
 });
@@ -28,8 +30,10 @@ export const appPool = mysql.createPool({
   password: process.env.APP_DB_PASSWORD,
   database: process.env.APP_DB_NAME || 'voltstartev_db',
   waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
+  connectionLimit: 25,
+  queueLimit: 100,
+  connectTimeout:   15000,     // 15s to get a connection
+  idleTimeout:      60000,     // release idle connections after 60s
   enableKeepAlive: true,
   keepAliveInitialDelay: 10000,
 });
@@ -185,5 +189,22 @@ export async function closeAllConnections(): Promise<void> {
     logger.info(' All database connections closed');
   } catch (error: any) {
     logger.error(' Error during connection cleanup', { error: error.message });
+  }
+}
+
+/**
+ * Execute INSERT / UPDATE / DELETE
+ */
+export async function steveDbExecute(query: string, params: any[] = []) {
+  try {
+    const [result] = await stevePool.execute(query, params);
+    return result;
+  } catch (error) {
+    console.error('SteVe DB Execute Error:', {
+      query,
+      params,
+      error
+    });
+    throw error;
   }
 }

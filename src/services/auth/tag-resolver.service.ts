@@ -1,5 +1,5 @@
 // src/services/auth/tag-resolver.service.ts
-import { steveQuery } from '../../config/database.js';
+import { appDbQuery, steveQuery } from '../../config/database.js';
 import logger from '../../config/logger.js';
 
 /**
@@ -41,22 +41,30 @@ export async function resolveUserIdForTag(idTag: string): Promise<number | null>
  * Validate that a tag is assigned to a specific user
  * Returns true if user_pk matches the provided userId
  */
-export async function validateTagForUser(idTag: string, userId: number): Promise<boolean> {
-  if (!idTag || !userId) return false;
-  
+export async function validateTagForUser(userId: number, idTag: string): Promise<boolean> {
+  // Primary check: user_tags table (fastest, covers all tag types)
+  const [appTag] = await appDbQuery<any>(`
+    SELECT id FROM user_tags
+    WHERE app_user_id = ?
+      AND ocpp_tag_id = ?
+      AND is_active = 1
+    LIMIT 1
+  `, [userId, idTag]);
+
+  if (appTag) return true;
+
+  // Fallback: stevedb.user_ocpp_tag (for legacy/manually-created tags)
   try {
-    const [linkage] = await steveQuery(`
-      SELECT 1
-      FROM user_ocpp_tag uot
-      JOIN ocpp_tag ot ON ot.ocpp_tag_pk = uot.ocpp_tag_pk
-      WHERE ot.id_tag = ? AND uot.user_pk = ?
+    const [steveTag] = await steveQuery<any>(`
+      SELECT uot.user_pk
+      FROM stevedb.user_ocpp_tag uot
+      JOIN stevedb.ocpp_tag ot ON ot.ocpp_tag_pk = uot.ocpp_tag_pk
+      WHERE uot.user_pk = ?
+        AND ot.id_tag = ?
       LIMIT 1
-    `, [idTag, userId]);
-    
-    return !!linkage;
-    
-  } catch (error) {
-    logger.error(' Failed to validate tag for user', { idTag, userId, error });
+    `, [userId, idTag]);
+    return !!steveTag;
+  } catch {
     return false;
   }
 }

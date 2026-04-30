@@ -2,6 +2,21 @@
 import { appDbQuery } from '../../config/database.js';
 import logger from '../../config/logger.js';
 
+let pricingCache: Record<string, any> | null = null;
+let pricingCacheExpiry = 0;
+const PRICING_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+let cacheHits = 0;
+let cacheMisses = 0;
+
+export function getCacheStats() {
+  const total = cacheHits + cacheMisses;
+  return {
+    hits: cacheHits,
+    misses: cacheMisses,
+    hitRate: total > 0 ? ((cacheHits / total) * 100).toFixed(1) + '%' : 'N/A',
+  };
+}
+
 export interface PricingRule {
   id: number;
   chargeBoxId: string;
@@ -83,6 +98,14 @@ export async function getPricingForCharger(
 
 // ── Get all charger pricing (for map display) ─────────
 export async function getAllChargerPricing(): Promise<Record<string, PricingRule>> {
+  // Return cached version if still fresh
+  if (pricingCache && Date.now() < pricingCacheExpiry) {
+    cacheHits++;
+    console.log('🎯 PRICING CACHE HIT');
+    return pricingCache;
+  }
+  console.log('🔄 PRICING CACHE MISS - fetching from DB'); 
+  cacheMisses++;
   const rows = await appDbQuery<any>(`
     SELECT *
     FROM charger_pricing
@@ -110,7 +133,16 @@ export async function getAllChargerPricing(): Promise<Record<string, PricingRule
       notes: r.notes,
     };
   }
+  // Cache it
+  pricingCache = result;
+  pricingCacheExpiry = Date.now() + PRICING_CACHE_TTL;
   return result;
+}
+
+// Call this when pricing is updated via admin
+export function invalidatePricingCache() {
+  pricingCache = null;
+  pricingCacheExpiry = 0;
 }
 
 // ── Format rate for display ───────────────────────────

@@ -58,7 +58,7 @@ export async function sendEmail(
 }
 
 // ─────────────────────────────────────────────────────
-// OTP Email
+// OTP Email — security warnings
 // ─────────────────────────────────────────────────────
 export async function sendOtpEmail(
   to: string,
@@ -179,7 +179,7 @@ export async function sendSessionStartedEmail(
 }
 
 // ─────────────────────────────────────────────────────
-// Session Completed Email
+// Session Completed Email — Stats grid + CO₂ impact
 // ─────────────────────────────────────────────────────
 export async function sendSessionCompletedEmail(
   to: string,
@@ -192,7 +192,7 @@ export async function sendSessionCompletedEmail(
     stopReason?: string;
   }
 ): Promise<void> {
-  const subject = '✅ VoltStartEV — Charging Complete';
+  const subject = 'VoltStartEV — Charging Complete';
   const durationMin = Math.floor(data.duration / 60);
   const co2Saved = (data.energyKwh * 0.82).toFixed(1);
 
@@ -204,7 +204,7 @@ export async function sendSessionCompletedEmail(
       <div style="max-width:480px;margin:0 auto;
                   background:#1e293b;border-radius:16px;padding:32px">
         <h1 style="color:#22c55e;font-size:22px;margin:0 0 4px">
-          ✅ Charging Complete
+          Charging Complete
         </h1>
         <p style="color:#64748b;margin:0 0 24px;font-size:14px">
           ${data.chargeBoxId}

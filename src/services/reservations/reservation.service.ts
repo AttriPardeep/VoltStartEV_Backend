@@ -85,74 +85,78 @@ export async function createReservation(
     throw new Error(`Connector #${connectorId} not found on ${chargeBoxId}`);
   }
 
-  // 5. Call SteVe REST API to send ReserveNow to charger
+  // 5. Prepare reservation data
   const expiresAt = new Date(Date.now() + RESERVATION_MINS * 60 * 1000);
   const expiresISO = expiresAt.toISOString();
 
-  const credentials = Buffer.from(`${STEVE_USER}:${STEVE_PASS}`).toString('base64');
-
-  try {
-    const response = await fetch(
-      `${STEVE_BASE}/steve/api/v1/operations/ReserveNow`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Basic ${credentials}`,
-        },
-        body: JSON.stringify({
-          chargeBoxIdList: [chargeBoxId],
-          connectorId,
-          idTag,
-          expiry: expiresISO,
-        }),
-      }
-    );
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      logger.error('SteVe reservation API failed', {
-        status: response.status, error: errorText, chargeBoxId
-      });
-      throw new Error(`SteVe API error: ${response.status} - ${errorText}`);
-    }
-    
-    logger.info('SteVe ReserveNow sent', { chargeBoxId, connectorId, idTag });
-  } catch (err: any) {
-    logger.error('Could not reach SteVe API for reservation', { error: err.message });
-    throw new Error('Failed to create reservation with charger');
-  }
-
-  // 6. Record in our DB (initially with NULL steve_reservation_pk)
+  // 6. Insert into app DB FIRST with NULL steve_reservation_pk — return immediately
   const result = await appDbExecute(`
     INSERT INTO app_reservations
       (user_id, steve_reservation_pk, charge_box_id, connector_id,
        id_tag, status, expires_at)
-    VALUES (?, ?, ?, ?, ?, 'active', ?)
+    VALUES (?, NULL, ?, ?, ?, 'active', ?)
   `, [
-    userId, null, chargeBoxId,  // steve_reservation_pk starts as NULL
-    connectorId, idTag, expiresAt
+    userId, chargeBoxId, connectorId, idTag, expiresAt
   ]);
 
   const reservationId = (result as any).insertId;
 
-  // 7. Query SteVe to find the reservation_pk and update mapping
-  const stevePk = await getSteveReservationPk(chargeBoxId, connectorId, idTag);
-  if (stevePk) {
-    await appDbExecute(
-      'UPDATE app_reservations SET steve_reservation_pk = ? WHERE id = ?',
-      [stevePk, reservationId]
-    );
-    logger.info('Mapped app reservation to SteVe pk', {
-      appReservationId: reservationId,
-      steveReservationPk: stevePk
-    });
-  } else {
-    logger.warn('Could not find SteVe reservation_pk immediately after creation', {
-      chargeBoxId, connectorId, idTag
-    });
-  }
+  // 7. Fire SteVe API call asynchronously — don't block the response
+  (async () => {
+    try {
+      const credentials = Buffer.from(`${STEVE_USER}:${STEVE_PASS}`).toString('base64');
+      
+      const response = await fetch(
+        `${STEVE_BASE}/steve/api/v1/operations/ReserveNow`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Basic ${credentials}`,
+          },
+          body: JSON.stringify({
+            chargeBoxIdList: [chargeBoxId],
+            connectorId,
+            idTag,
+            expiry: expiresISO,
+          }),
+        }
+      );
 
-  logger.info('Reservation created', {
+      if (response.ok) {
+        logger.info('SteVe ReserveNow sent (async)', { chargeBoxId, connectorId, idTag });
+        
+        // 8. Query SteVe to find the reservation_pk and update mapping asynchronously
+        const stevePk = await getSteveReservationPk(chargeBoxId, connectorId, idTag);
+        if (stevePk) {
+          await appDbExecute(
+            'UPDATE app_reservations SET steve_reservation_pk = ? WHERE id = ?',
+            [stevePk, reservationId]
+          );
+          logger.info('Mapped app reservation to SteVe pk (async)', {
+            appReservationId: reservationId,
+            steveReservationPk: stevePk
+          });
+        } else {
+          logger.warn('Could not find SteVe reservation_pk after async call', {
+            chargeBoxId, connectorId, idTag
+          });
+        }
+      } else {
+        const errorText = await response.text();
+        logger.error('SteVe reservation API failed (async)', {
+          status: response.status, error: errorText, chargeBoxId
+        });
+        // Optionally mark reservation as failed in DB if needed
+      }
+    } catch (err: any) {
+      logger.error('Could not reach SteVe API for reservation (async)', { 
+        error: err.message, chargeBoxId 
+      });
+    }
+  })(); // Immediately invoked async function — NOT awaited
+
+  // 9. Return immediately to mobile app — don't wait for SteVe
+  logger.info('Reservation created (response sent to client)', {
     reservationId, userId, chargeBoxId, connectorId
   });
 

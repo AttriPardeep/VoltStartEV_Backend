@@ -7,6 +7,22 @@ import { z } from 'zod';
 
 import logger from '../../config/logger.js';
 
+// 
+let configCache: Record<string, ChargerConfig> | null = null;
+let configCacheExpiry = 0;
+const CONFIG_CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+let cacheHits = 0;
+let cacheMisses = 0;
+
+export function getCacheStats() {
+  const total = cacheHits + cacheMisses;
+  return {
+    hits: cacheHits,
+    misses: cacheMisses,
+    hitRate: total > 0 ? ((cacheHits / total) * 100).toFixed(1) + '%' : 'N/A',
+  };
+}
+
 // ─────────────────────────────────────────────────────
 // SIMPLIFIED STATUS MODEL (User-facing)
 // ─────────────────────────────────────────────────────
@@ -63,6 +79,13 @@ interface ChargerConfig {
 
 async function getChargerConfigsMap(): Promise<Record<string, ChargerConfig>> {
   try {
+    if (configCache && Date.now() < configCacheExpiry) {
+      cacheHits++;
+      console.log('🎯 CHARGER CONFIG CACHE HIT');
+      return configCache;
+    }
+    cacheMisses++;
+    console.log('🔄 CHARGER CONFIG CACHE MISS - fetching from DB'); 
     const rows = await appDbQuery<any>(`
       SELECT charge_box_id, max_power_w, power_type
       FROM charger_config
@@ -77,12 +100,20 @@ async function getChargerConfigsMap(): Promise<Record<string, ChargerConfig>> {
         powerType: row.power_type,
       };
     });
-
+    configCache = map;
+    configCacheExpiry = Date.now() + CONFIG_CACHE_TTL;
     return map;
   } catch (error) {
     logger.error('Failed to fetch charger configs', { error });
     return {};  // Return empty map on error
   }
+}
+
+
+// ── Invalidate cache when admin updates config ───────
+export function invalidateChargerConfigCache() {
+  configCache = null;
+  configCacheExpiry = 0;
 }
 
 // ─────────────────────────────────────────────────────

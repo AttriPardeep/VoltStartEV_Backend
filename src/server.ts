@@ -28,7 +28,8 @@ import { startReportsJob } from './jobs/reconciliation.job.js';
 import { verifySmtpConnection } from './services/email/email.service.js';
 import reservationRoutes from './routes/reservations.routes.js';
 import { startReservationJob } from './jobs/reservation.job.js';
-
+// fleet
+import fleetRoutes       from './routes/fleet.routes.js';
 // AI Assistance 
 import assistantRoutes from './routes/assistant.routes.js';
 // Wallet 
@@ -71,6 +72,8 @@ app.use('/', healthRoutes);
 app.use('/api/assistant', assistantRoutes);
 // Wallet 
 app.use('/api/wallet', walletRoutes);
+// fleet
+app.use('/api/fleet',        fleetRoutes);
 // Error handling middleware (must be last)
 app.use(errorHandler);
 

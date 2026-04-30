@@ -1,7 +1,8 @@
 // src/services/events/telemetry-extractor.ts
 
 export interface Telemetry {
-  energyKwh:  number | null;
+  meterWh:    number | null;  
+  energyKwh:  number | null;  
   powerW:     number | null;
   currentA:   number | null;
   voltageV:   number | null;
@@ -27,34 +28,42 @@ export function extractTelemetry(sampledValues: SampledValue[]): Telemetry | nul
       s.measurand === measurand &&
       (phase ? s.phase === phase : !s.phase || s.phase === null)
     );
+
     if (!entry) return null;
+
     const v = parseFloat(entry.value);
     return isNaN(v) ? null : v;
   };
 
-  // Energy.Active.Import.Register — OCPP unit is Wh, we convert to kWh
-  const energyWh = pick('Energy.Active.Import.Register');
-  const energyKwh = energyWh !== null ? +(energyWh / 1000).toFixed(4) : null;
+  // 1. METER (AUTHORITATIVE SOURCE)
+  // OCPP standard: Wh cumulative
+  const meterWh = pick('Energy.Active.Import.Register');
 
-  // Power in Watts
+  // 2. Derived energy (ONLY for UI display)
+  const energyKwh = meterWh !== null
+    ? +(meterWh / 1000).toFixed(4)
+    : null;
+
+  // Power (W)
   const powerW = pick('Power.Active.Import');
 
-  // Current — prefer aggregate, fall back to L1 if charger only sends per-phase
+  // Current
   const currentA = pick('Current.Import') ?? pick('Current.Import', 'L1');
 
-  // Voltage — prefer aggregate L-N, fall back to L1-N
+  // Voltage
   const voltageV = pick('Voltage') ?? pick('Voltage', 'L1-N');
 
-  // State of Charge (battery %)
+  // SOC
   const socPercent = pick('SoC');
 
-  // Per-phase currents for 3-phase chargers
+  // Per phase
   const currentL1 = pick('Current.Import', 'L1');
   const currentL2 = pick('Current.Import', 'L2');
   const currentL3 = pick('Current.Import', 'L3');
 
   return {
-    energyKwh,
+    meterWh,     
+    energyKwh, 
     powerW,
     currentA,
     voltageV,

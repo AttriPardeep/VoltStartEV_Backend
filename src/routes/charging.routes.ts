@@ -11,7 +11,7 @@ import {
   isConnectorReservedByOther, 
   markReservationUsed 
 } from '../services/reservations/reservation.service.js';
-
+import { getUserIdTag } from '../services/auth/tag.service.js';
 import logger from '../config/logger.js';
 
 const router = Router();
@@ -23,9 +23,10 @@ const router = Router();
 // POST /api/charging/start - Start charging session
 router.post('/start', authenticateJwt, async (req: Request, res: Response) => {
   try {
-    const { chargeBoxId, connectorId, idTag } = req.body;
+    const { chargeBoxId, connectorId } = req.body;
     const appUserId = (req as any).user?.id;
-    
+    const idTag = await getUserIdTag(appUserId);
+
     // Validate required fields
     if (!chargeBoxId || !connectorId || !idTag) {
       return res.status(400).json({
@@ -35,9 +36,22 @@ router.post('/start', authenticateJwt, async (req: Request, res: Response) => {
         timestamp: new Date().toISOString()
       });
     }
-    
+
+    if (!idTag) {
+      return res.status(400).json({
+        error: 'No charging tag configured. Please add an RFID tag in Profile.'
+      });
+    }    
     // Validate tag is assigned to this user
-    const isAssigned = await validateTagForUser(idTag, appUserId);
+logger.info('Charging session start requested', {
+  appUserId,
+  idTag,
+  chargeBoxId,
+  connectorId,
+  ip: req.ip,
+});
+
+    const isAssigned = await validateTagForUser(appUserId, idTag);
     if (!isAssigned) {
       return res.status(403).json({
         success: false,
@@ -355,8 +369,6 @@ router.get('/session/active', authenticateJwt, async (req: Request, res: Respons
   }
 });
 
-// GET /api/charging/sessions - Get session history for user
-// GET /api/charging/sessions - Get session history for user
 router.get('/sessions', authenticateJwt, async (req: Request, res: Response) => {
   try {
     const rawUserId = (req as any).user?.id;
@@ -382,25 +394,29 @@ router.get('/sessions', authenticateJwt, async (req: Request, res: Response) => 
     }
 
     const sessions = await appDbQuery(
-      `SELECT 
-  session_id,
-  charge_box_id,
-  connector_id,
-  id_tag,
-  start_time,
-  end_time,
-  duration_seconds,
-  energy_kwh,
-  total_cost,
-  status,
-  stop_reason,
-  payment_status,
-  created_at 
+      `SELECT
+        session_id,
+        charge_box_id,
+        connector_id,
+        id_tag,
+        start_time,
+        end_time,
+        duration_seconds,    
+        energy_kwh,         
+        start_meter_value,
+        end_meter_value,
+        total_cost,         
+        pricing_model,      
+        tiers,            
+        status,
+        stop_reason,
+        payment_status,
+        created_at
       FROM charging_sessions
       WHERE app_user_id = ?
       ORDER BY start_time DESC
-      LIMIT ${limit}`,
-      [appUserId]
+      LIMIT ${limit}`,              
+      [appUserId]    
     );
 
     logger.info('Charging sessions fetched', {
@@ -416,7 +432,7 @@ router.get('/sessions', authenticateJwt, async (req: Request, res: Response) => 
     });
 
   } catch (error: any) {
-    logger.error('Failed to fetch session history', { 
+    logger.error('Failed to fetch session history', {
       error: error.message,
       sqlState: error.sqlState,
       userId: (req as any).user?.id,
